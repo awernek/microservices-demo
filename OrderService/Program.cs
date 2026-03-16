@@ -8,7 +8,8 @@ builder.Services.AddControllers();
 var rabbitHost = builder.Configuration["RabbitMQ:Host"] ?? "localhost";
 
 // Registra o publisher como Singleton — uma única conexão para toda a vida da aplicação
-builder.Services.AddSingleton(_ =>
+// Registra tanto pela interface quanto pela classe concreta (para o IAsyncDisposable funcionar)
+builder.Services.AddSingleton<IRabbitMqPublisher>(_ =>
     RabbitMqPublisher.CreateAsync(rabbitHost).GetAwaiter().GetResult()
 );
 

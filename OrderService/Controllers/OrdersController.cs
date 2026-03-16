@@ -8,10 +8,10 @@ namespace OrderService.Controllers;
 [Route("[controller]")]
 public class OrdersController : ControllerBase
 {
-    private readonly RabbitMqPublisher _publisher;
+    private readonly IRabbitMqPublisher _publisher;
     private readonly ILogger<OrdersController> _logger;
 
-    public OrdersController(RabbitMqPublisher publisher, ILogger<OrdersController> logger)
+    public OrdersController(IRabbitMqPublisher publisher, ILogger<OrdersController> logger)
     {
         _publisher = publisher;
         _logger = logger;

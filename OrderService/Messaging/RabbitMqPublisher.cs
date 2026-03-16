@@ -5,7 +5,7 @@ using RabbitMQ.Client;
 namespace OrderService.Messaging;
 
 // Implementa IAsyncDisposable para fechar a conexão corretamente quando o serviço parar
-public class RabbitMqPublisher : IAsyncDisposable
+public class RabbitMqPublisher : IRabbitMqPublisher, IAsyncDisposable
 {
     private readonly IConnection _connection;
     private readonly IChannel _channel;
@@ -18,9 +18,9 @@ public class RabbitMqPublisher : IAsyncDisposable
         _channel = channel;
     }
 
-    public static async Task<RabbitMqPublisher> CreateAsync(string host)
+    public static async Task<RabbitMqPublisher> CreateAsync(string host, int port = 5672)
     {
-        var factory = new ConnectionFactory { HostName = host };
+        var factory = new ConnectionFactory { HostName = host, Port = port };
         var connection = await factory.CreateConnectionAsync();
         var channel = await connection.CreateChannelAsync();
 
