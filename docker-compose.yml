@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"   # porta AMQP (sua app conecta aqui)
+      - "15672:15672" # painel web de admin
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+
+  order-service:
+    build: ./OrderService
+    depends_on:
+      - rabbitmq
+    ports:
+      - "5000:8080"   # acessa a API em http://localhost:5000
+    environment:
+      - RabbitMQ__Host=rabbitmq
+
+  notification-service:
+    build: ./NotificationService
+    depends_on:
+      - rabbitmq
+    environment:
+      - RabbitMQ__Host=rabbitmq

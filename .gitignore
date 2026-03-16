@@ -1,0 +1,15 @@
+# Build
+bin/
+obj/
+out/
+
+# .NET
+*.user
+*.suo
+.vs/
+
+# Logs
+*.log
+
+# Docker
+.dockerignore
