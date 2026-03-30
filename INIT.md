@@ -1,84 +1,73 @@
 # Como inicializar o projeto
 
-Guia rápido para subir o ambiente. Documentação completa em [README.md](README.md).
+Guia rapido para subir e validar o ambiente local. Para detalhes completos, veja [README.md](README.md).
 
-## Pré-requisitos
+## Pre-requisitos
 
-- [Docker Desktop](https://www.docker.com/products/docker-desktop) instalado e rodando
-- [.NET 8 SDK](https://dotnet.microsoft.com/download) (opcional; necessário só para desenvolvimento local e testes)
+- [Docker Desktop](https://www.docker.com/products/docker-desktop) instalado e em execucao
+- [.NET 8 SDK](https://dotnet.microsoft.com/download) (opcional; necessario para rodar testes locais)
 
-## 1. Clonar o repositório
+## 1) Clonar o repositorio
 
 ```bash
 git clone <url-do-repo>
 cd microservices-demo
 ```
 
-## 2. Subir os containers
+## 2) Subir os containers
 
 ```bash
 docker compose up --build
 ```
 
-Ou com Docker Compose v1: `docker-compose up --build`.
+Alternativa (Compose v1):
 
-Aguarde até ver no terminal:
-
-```
-notification-service  | NotificationService aguardando mensagens...
+```bash
+docker-compose up --build
 ```
 
-## 3. Verificar o RabbitMQ
+Espere ate aparecer no log do worker:
 
-Acesse **http://localhost:15672**
+```text
+NotificationService pronto. Aguardando mensagens...
+```
 
-- Usuário: `guest`
+## 3) Validar o RabbitMQ
+
+Abra <http://localhost:15672>:
+
+- Usuario: `guest`
 - Senha: `guest`
 
-## 4. Enviar um pedido de teste
+## 4) Enviar um pedido de teste
 
-**PowerShell:**
+**PowerShell**
 
 ```powershell
 Invoke-RestMethod -Method Post -Uri "http://localhost:5000/orders" `
   -ContentType "application/json" `
-  -Body '{"customerName": "João Silva", "totalAmount": 150.90}'
+  -Body '{"customerName": "Joao Silva", "totalAmount": 150.90}'
 ```
 
-**curl (cmd):**
+## 5) Confirmar processamento ponta a ponta
 
-```cmd
-curl.exe -X POST http://localhost:5000/orders -H "Content-Type: application/json" -d "{\"customerName\": \"Joao Silva\", \"totalAmount\": 150.90}"
-```
+No terminal do `notification-service`, confirme sinais de processamento:
 
-**curl (Linux/macOS/Git Bash):**
+- Pedido recebido pelo `OrderConsumer`
+- Despacho de 3 notificacoes (`email`, `push`, `sms`)
+- Possiveis retries (`[RETRY x/3]`) e, se necessario, DLQ (`[DLQ]`)
+- Metricas resumidas a cada 30 segundos
 
-```bash
-curl -X POST http://localhost:5000/orders \
-  -H "Content-Type: application/json" \
-  -d '{"customerName": "João Silva", "totalAmount": 150.90}'
-```
-
-## 5. Confirmar que funcionou
-
-No terminal do Docker, o `notification-service` deve exibir:
-
-```
-Notificação enviada! Pedido <id> do cliente 'João Silva' no valor de R$ 150,90
-```
-
-## 6. Rodar os testes (opcional)
-
-Com .NET 8 SDK instalado:
+## 6) Rodar testes (opcional)
 
 ```bash
 dotnet test
 ```
 
-## Parar os containers
+## 7) Parar o ambiente
 
 ```bash
 docker compose down
 ```
 
-Ou: `docker-compose down`.
+Alternativa: `docker-compose down`.
