@@ -1,12 +1,14 @@
 using System.Text;
 using System.Text.Json;
-using NotificationService.Models;
+using Contracts;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 
 namespace NotificationService.Messaging;
 
-// Lê pedidos da fila "orders" e gera uma NotificationMessage por canal (email, push, sms)
+// Lê pedidos da fila "orders" e publica uma NotificationMessage por canal no notifications.exchange.
+// Routing key = notification.Type ("email", "push" ou "sms") — cada serviço consumidor
+// faz o binding da sua fila com a routing key correspondente.
 public class OrderConsumer
 {
     private readonly IChannel _consumeChannel;
@@ -43,7 +45,7 @@ public class OrderConsumer
         var json = Encoding.UTF8.GetString(args.Body.ToArray());
         var order = JsonSerializer.Deserialize<OrderCreatedMessage>(json)!;
 
-        // Um pedido dispara 3 notificações independentes — cada uma tem seu próprio ID e ciclo de retry
+        // Um pedido dispara 3 notificações independentes — cada uma roteada pelo seu tipo
         var notifications = new[]
         {
             new NotificationMessage
@@ -74,9 +76,10 @@ public class OrderConsumer
             var body = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(notification));
             var props = new BasicProperties { Persistent = true };
 
+            // Routing key = tipo da notificação — EmailService faz binding em "email", etc.
             await _publishChannel.BasicPublishAsync(
                 exchange: RabbitMqTopology.NotificationsExchange,
-                routingKey: "notification",
+                routingKey: notification.Type,
                 mandatory: false,
                 basicProperties: props,
                 body: body
@@ -84,7 +87,7 @@ public class OrderConsumer
         }
 
         _logger.LogInformation(
-            "[OrderConsumer] Pedido {OrderId} → {Count} notificações despachadas",
+            "[OrderConsumer] Pedido {OrderId} → {Count} notificações despachadas (email, push, sms)",
             order.OrderId,
             notifications.Length
         );

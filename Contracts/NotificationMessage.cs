@@ -1,6 +1,8 @@
-namespace NotificationService.Models;
+namespace Contracts;
 
-// Record permite usar "with" para criar cópias imutáveis (usado no retry)
+// Contrato compartilhado entre NotificationService (produtor) e Email/Push/SmsService (consumidores).
+// Record permite criar cópias imutáveis com "with" — essencial para o mecanismo de retry:
+//   message with { RetryCount = message.RetryCount + 1 }
 public record NotificationMessage
 {
     public Guid NotificationId { get; init; } = Guid.NewGuid();

@@ -1,7 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using OrderService.Messaging;
-using OrderService.Models;
+using Contracts;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 using Testcontainers.RabbitMq;

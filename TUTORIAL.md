@@ -18,7 +18,8 @@
 10. [Etapa 7 — Rodando o Projeto Completo](#10-etapa-7--rodando-o-projeto-completo)
 11. [Glossário](#11-glossário)
 12. [Diagrama Completo da Arquitetura](#12-diagrama-completo-da-arquitetura)
-13. [Dicas e Próximos Passos](#13-dicas-e-próximos-passos)
+13. [Outbox Pattern — Garantindo que Mensagens Não se Perdem](#13-outbox-pattern--garantindo-que-mensagens-não-se-perdem)
+14. [Dicas e Próximos Passos](#14-dicas-e-próximos-passos)
 
 ---
 
@@ -108,7 +109,11 @@ O **Docker** empacota seu programa e tudo que ele precisa (sistema operacional, 
 **Analogia**: é como mandar uma mudança numa caixa fechada. Não importa se a pessoa vai colocar no apartamento ou na casa — dentro da caixa, tudo está organizado do mesmo jeito.
 
 - **Dockerfile**: a receita que ensina como montar a caixa.
-- **Docker Compose**: o "maestro" que sobe várias caixas de uma vez (RabbitMQ + OrderService + NotificationService).
+- **Docker Compose**: um **script de desenvolvimento local** que sobe múltiplos containers com um único comando. Não confunda com orquestração de produção — em prod você usaria Kubernetes, AWS ECS ou similar.
+
+> ⚠️ **Docker Compose ≠ arquitetura de produção**
+>
+> O `docker-compose.yml` é uma ferramenta de conveniência para dev/local. Ele não faz balanceamento de carga, não reinicia containers que falham em cascata, não faz deploy incremental, e não distribui serviços entre máquinas. Em produção, você precisa de um orquestrador real (Kubernetes, ECS, etc.).
 
 ### 2.4 Padrões que vamos usar
 
@@ -2110,20 +2115,64 @@ services:
     environment:
       RABBITMQ_DEFAULT_USER: guest
       RABBITMQ_DEFAULT_PASS: guest
+    # Healthcheck garante que os serviços só iniciam quando o RabbitMQ estiver
+    # realmente pronto — depends_on sem condition não garante isso.
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
   order-service:
-    build: ./OrderService
+    build:
+      context: .
+      dockerfile: OrderService/Dockerfile
     depends_on:
-      - rabbitmq
+      rabbitmq:
+        condition: service_healthy
     ports:
       - "5000:8080"   # acessa a API em http://localhost:5000
     environment:
       - RabbitMQ__Host=rabbitmq
 
   notification-service:
-    build: ./NotificationService
+    build:
+      context: .
+      dockerfile: NotificationService/Dockerfile
     depends_on:
-      - rabbitmq
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      - RabbitMQ__Host=rabbitmq
+
+  email-service:
+    build:
+      context: .
+      dockerfile: EmailService/Dockerfile
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      - RabbitMQ__Host=rabbitmq
+
+  push-service:
+    build:
+      context: .
+      dockerfile: PushService/Dockerfile
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      - RabbitMQ__Host=rabbitmq
+
+  sms-service:
+    build:
+      context: .
+      dockerfile: SmsService/Dockerfile
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
     environment:
       - RabbitMQ__Host=rabbitmq
 ```
@@ -2131,6 +2180,10 @@ services:
 **O que é Docker Compose?**
 
 Docker Compose permite definir e rodar **múltiplos containers** com um único comando. Em vez de rodar `docker run` para cada serviço, escrevemos um arquivo YAML que descreve tudo e rodamos `docker compose up`.
+
+> **Por que `build: context: .` em vez de `build: ./OrderService`?**
+>
+> Os serviços têm um `ProjectReference` para o projeto `Contracts`. O Docker constrói a imagem usando apenas os arquivos dentro do build context. Se o context for `./OrderService`, o Docker não enxerga `../Contracts` — a build falha. Usar a raiz do repo como context resolve isso. O `dockerfile` explícito diz qual Dockerfile usar dentro desse context.
 
 **Entendendo cada serviço:**
 
@@ -2161,12 +2214,12 @@ order-service:
       - RabbitMQ__Host=rabbitmq
 ```
 
-- `build: ./OrderService`: constrói a imagem usando o Dockerfile em `./OrderService`.
-- `depends_on: rabbitmq`: garante que o RabbitMQ inicia **antes** do OrderService (mas não espera ele ficar "pronto" — por isso temos o `WaitForRabbitMqAsync`).
+- `build: { context: ., dockerfile: OrderService/Dockerfile }`: constrói a imagem usando a raiz do repo como contexto (necessário porque `OrderService` referencia o projeto `Contracts`).
+- `depends_on: rabbitmq: condition: service_healthy`: aguarda o healthcheck do RabbitMQ passar antes de subir o serviço. Combinado com o `WaitForRabbitMqAsync` no código, garante que a conexão AMQP esteja disponível.
 
 > 💭 **Pare e pense — "started" vs. "ready"**
 >
-> `depends_on` garante ordem de *início*, não de *prontidão*. Um container pode estar "started" mas ainda inicializando internamente. Esse problema clássico tem um nome: *startup race condition*. O `WaitForRabbitMqAsync` que criamos é uma solução caseira. Em produção, o Docker Compose suporta `depends_on` com `condition: service_healthy` combinado com `healthcheck` no container do RabbitMQ — isso deixa o Compose esperar o serviço ficar de fato saudável. Quais outros cenários teriam esse problema? Pense em banco de dados + migrations.
+> `depends_on` sem `condition` garante apenas ordem de *início*, não de *prontidão*. Um container pode estar "started" mas ainda inicializando internamente. Esse problema clássico tem um nome: *startup race condition*. A combinação `healthcheck` + `condition: service_healthy` resolve no nível do Compose. O `WaitForRabbitMqAsync` no código é uma camada extra de defesa — importante quando o serviço é reiniciado isoladamente sem passar pelo Compose. Quais outros cenários teriam esse problema? Pense em banco de dados + migrations.
 
 
 - `"5000:8080"`: o ASP.NET roda na porta 8080 dentro do container. Mapeamos para 5000 no host. Então você acessa `http://localhost:5000`.
@@ -2771,78 +2824,172 @@ Isso derruba todos os containers e limpa os recursos.
   │   navegador)      │
   └────────┬─────────┘
            │ POST /orders
-           │ { customerName, totalAmount }
            ▼
-  ┌──────────────────┐
-  │   OrderService   │   ◄── ASP.NET Web API (.NET 8)
-  │   (porta 5000)   │       Container Docker
-  │                  │
-  │  OrdersController│
-  │       │          │
-  │       ▼          │
-  │  RabbitMqPublisher│──── Serializa para JSON
-  └────────┬─────────┘     e publica
-           │
-           │ exchange: "" (default)
-           │ routingKey: "orders"
-           ▼
-╔══════════════════════════════════════════════════════════════════════════════╗
-║                              RABBITMQ                                      ║
-║                        (Container Docker)                                  ║
-║                                                                            ║
-║  ┌──────────┐                                                              ║
-║  │  orders   │ ◄── fila de pedidos (durable)                               ║
-║  └─────┬────┘                                                              ║
-║        │                                                                   ║
-║        │ (consumido pelo OrderConsumer)                                     ║
-║        │                                                                   ║
-║  ┌─────────────────────────┐     ┌───────────────────────────┐             ║
-║  │  notifications.exchange │     │ notifications.retry.       ║             ║
-║  │  (DIRECT)               │     │ exchange (DIRECT)          │             ║
-║  └───────────┬─────────────┘     └──────────┬────────────────┘             ║
-║              │ "notification"               │ "retry.1/2/3"               ║
-║              ▼                              ▼                              ║
-║  ┌────────────────────┐     ┌──────────────────────────────┐               ║
-║  │  notifications     │◄────│  notifications.retry.1 (5s)  │               ║
-║  │  (fila principal)  │◄────│  notifications.retry.2 (15s) │               ║
-║  │                    │◄────│  notifications.retry.3 (45s) │               ║
-║  └────────────────────┘     └──────────────────────────────┘               ║
-║                                                                            ║
-║  ┌────────────────────┐                                                    ║
-║  │  notifications.dlq │ ◄── mensagens que esgotaram retries                ║
-║  └────────────────────┘                                                    ║
-╚══════════════════════════════════════════════════════════════════════════════╝
-           │
-           │ (consumido pelo NotificationConsumer)
-           ▼
-  ┌──────────────────────────────────────────────────┐
-  │            NotificationService                   │ ◄── Worker (.NET 8)
-  │            (Container Docker)                    │     Container Docker
-  │                                                  │
-  │  ┌─────────────┐  ┌──────────────────────────┐   │
-  │  │OrderConsumer │  │  NotificationConsumer    │   │
-  │  │  (1 pedido   │  │  (5 notificações em     │   │
-  │  │   = 3 notif) │  │   paralelo, retry,      │   │
-  │  └─────────────┘  │   DLQ, idempotência)     │   │
-  │                    └──────────────────────────┘   │
-  │                                                   │
-  │  Handlers (Strategy Pattern):                     │
-  │  ┌───────────────┬──────────────┬──────────────┐  │
-  │  │ Email (30%    │ Push (20%    │ SMS (40%     │  │
-  │  │  falha sim.)  │  falha sim.) │  falha sim.) │  │
-  │  └───────────────┴──────────────┴──────────────┘  │
-  │                                                   │
-  │  Serviços de suporte:                             │
-  │  ┌───────────────────┬─────────────────────────┐  │
-  │  │ IdempotencyService│ MetricsService           │  │
-  │  │ (evita duplicatas)│ (contadores + log 30s)  │  │
-  │  └───────────────────┴─────────────────────────┘  │
-  └──────────────────────────────────────────────────┘
+  ┌──────────────────────────────────┐
+  │          OrderService            │  ◄── ASP.NET Web API (.NET 8)
+  │          (porta 5000)            │
+  │                                  │
+  │  OrdersController                │
+  │    └── Enqueue(message)          │
+  │          ▼                       │
+  │      OutboxStore                 │  ◄── in-memory (ConcurrentQueue)
+  │          ▲                       │       nunca falha por indisponibilidade
+  │      OutboxPublisher             │       do RabbitMQ
+  │    (BackgroundService, 1s)       │
+  │    TryPeek → Publish → Dequeue   │
+  │          │                       │
+  │      IRabbitMqPublisher          │
+  └──────────┬───────────────────────┘
+             │ exchange: "" (default)
+             │ routingKey: "orders"
+             ▼
+╔═════════════════════════════════════════════════════════════════════════╗
+║                             RABBITMQ                                   ║
+║                       (Container Docker)                               ║
+║                                                                         ║
+║  ┌───────────┐                                                          ║
+║  │   orders  │ ◄── fila de pedidos (durable)                            ║
+║  └─────┬─────┘                                                          ║
+║        │ (consumido pelo NotificationService)                            ║
+║        ▼                                                                 ║
+║  ┌───────────────────────┐                                               ║
+║  │ notifications.exchange│  ◄── DIRECT exchange compartilhado            ║
+║  │       (DIRECT)        │                                               ║
+║  └──┬──────────┬────┬────┘                                               ║
+║     │"email"   │"push"  │"sms"                                           ║
+║     ▼          ▼        ▼                                                ║
+║  ┌──────────────────────────────────────────────────────────────────┐   ║
+║  │  notifications.email  │  notifications.push  │  notifications.sms │   ║
+║  │  + retry.1/2/3 (TTL)  │  + retry.1/2/3 (TTL) │  + retry.1/2/3    │   ║
+║  │  + email.dlq          │  + push.dlq           │  + sms.dlq        │   ║
+║  └──────────────────────────────────────────────────────────────────┘   ║
+╚═════════════════════════════════════════════════════════════════════════╝
+             │                    │                    │
+             ▼                    ▼                    ▼
+  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
+  │   EmailService   │  │   PushService    │  │   SmsService     │
+  │  Worker (.NET 8) │  │  Worker (.NET 8) │  │  Worker (.NET 8) │
+  │                  │  │                  │  │                  │
+  │ 30% falha sim.   │  │ 20% falha sim.   │  │ 40% falha sim.   │
+  │ (SMTP instável)  │  │ (token expirado) │  │ (operadora)      │
+  │ 50-150ms         │  │ 20-80ms          │  │ 100-300ms        │
+  │                  │  │                  │  │                  │
+  │ Idempotência     │  │ Idempotência     │  │ Idempotência     │
+  │ Retry + DLQ      │  │ Retry + DLQ      │  │ Retry + DLQ      │
+  │ Métricas (30s)   │  │ Métricas (30s)   │  │ Métricas (30s)   │
+  └──────────────────┘  └──────────────────┘  └──────────────────┘
+
+  ┌────────────────────────────────────────────────────────────┐
+  │              NotificationService (Dispatcher)              │
+  │              Worker (.NET 8)                               │
+  │                                                            │
+  │  OrderConsumer: lê "orders", cria 3 NotificationMessages,  │
+  │  publica em notifications.exchange com routing key =        │
+  │  notification.Type ("email" | "push" | "sms")              │
+  └────────────────────────────────────────────────────────────┘
+
+  Shared Library:
+  ┌─────────────────────────────────────────────────────┐
+  │  Contracts (classlib)                               │
+  │  ┌───────────────────────┬──────────────────────┐   │
+  │  │  OrderCreatedMessage  │  NotificationMessage  │   │
+  │  └───────────────────────┴──────────────────────┘   │
+  │  Referenciado por: OrderService, NotificationService,│
+  │  EmailService, PushService, SmsService               │
+  └─────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 13. Dicas e Próximos Passos
+## 13. Outbox Pattern — Garantindo que Mensagens Não se Perdem
+
+### O problema
+
+O `OrdersController` atual publica diretamente no RabbitMQ. O que acontece se o RabbitMQ estiver fora do ar no momento do pedido? A mensagem se perde, o pedido some, e o cliente não recebe nenhuma notificação.
+
+```text
+Sem Outbox:
+  Controller ──► RabbitMQPublisher ──► RabbitMQ
+                        ▲
+                   E se falhar aqui?
+                   A mensagem é perdida.
+```
+
+### A solução: Outbox Pattern
+
+O Outbox Pattern resolve isso com duas etapas:
+
+1. **Gravar localmente primeiro**: o controller coloca a mensagem numa estrutura local (o "outbox"), que nunca falha por motivos externos.
+2. **Publicar em background**: um processo em segundo plano drena o outbox em direção ao RabbitMQ.
+
+```text
+Com Outbox:
+  Controller ──► OutboxStore ──► (local, nunca falha)
+                                        ▲
+                               OutboxPublisher (1s)
+                                        │
+                               IRabbitMqPublisher ──► RabbitMQ
+                               Se falhar: não descarta,
+                               tenta no próximo ciclo.
+```
+
+### A lógica crítica: Peek antes de Dequeue
+
+```csharp
+// CERTO — peek antes de publicar:
+while (store.TryPeek(out var msg))
+{
+    await publisher.PublishAsync(msg);  // se falhar: throw
+    store.TryDequeue(out _);             // descarta SÓ após confirmação
+}
+
+// ERRADO — Dequeue antes de publicar:
+while (store.TryDequeue(out var msg))
+{
+    await publisher.PublishAsync(msg);  // se falhar: msg JÁ foi removida → perdida!
+}
+```
+
+Se você chamar `TryDequeue` antes de publicar e a publicação falhar, a mensagem some para sempre. O `TryPeek` garante que a mensagem permanece no store até confirmação de sucesso.
+
+### Implementação neste projeto
+
+**`OrderService/Outbox/OutboxStore.cs`** — wrapper de `ConcurrentQueue<OrderCreatedMessage>` com `Enqueue`, `TryPeek`, `TryDequeue`.
+
+**`OrderService/Outbox/OutboxPublisher.cs`** — `BackgroundService` com `PeriodicTimer(1s)`:
+```csharp
+while (TryPeek(out msg))
+{
+    try   { await Publish(msg); Dequeue(); }
+    catch { Log.Warning(...); break; }  // não descarta, tenta no próximo ciclo
+}
+```
+
+**`OrdersController.cs`** — agora injeta `OutboxStore` (não `IRabbitMqPublisher`):
+```csharp
+_outbox.Enqueue(message);  // síncrono, local, nunca falha
+return Accepted(...);       // responde imediatamente
+```
+
+### Limitações desta implementação (in-memory)
+
+Esta implementação usa `ConcurrentQueue` em memória. Se o processo reiniciar, as mensagens pendentes se perdem. Para produção:
+
+| Aspecto | In-memory (aqui) | Produção |
+|---|---|---|
+| **Persistência** | Não — perde na reinicialização | Tabela no banco de dados |
+| **Atomicidade** | Não — controller e outbox são operações separadas | Mesma transação do banco |
+| **Escalabilidade** | Não — funciona com 1 instância | Banco compartilhado, múltiplas instâncias |
+
+> **Em produção**: a tabela `outbox_messages` fica no mesmo banco de dados que a entidade `orders`. O controller grava os dois na **mesma transação**. Se a transação falhar, nenhum dos dois persiste. Se o processo reiniciar, o OutboxPublisher relê o banco e continua de onde parou. Essa garantia chama-se **atomicidade** — o "A" do ACID.
+
+### Por que isso cai em entrevista sênior?
+
+O Outbox Pattern aparece sempre que a pergunta é: *"Como você garante consistência entre seu banco de dados e seu broker de mensagens?"*. A resposta errada é "uso uma transação distribuída (2PC)". A resposta certa é: "uso o Outbox Pattern — gravo no banco e publico via polling do mesmo banco."
+
+---
+
+## 14. Dicas e Próximos Passos
 
 ### O que você aprendeu
 
@@ -2873,7 +3020,7 @@ Isso derruba todos os containers e limpa os recursos.
 ### Comandos úteis de referência rápida
 ---
 
-## 14. Mapa de Decisões — Quando Usar Cada Coisa
+## 15. Mapa de Decisões — Quando Usar Cada Coisa
 
 Este tutorial cobriu muitas ferramentas e padrões. Abaixo está um guia rápido para ajudar a decidir quando aplicar cada conceito em projetos futuros.
 

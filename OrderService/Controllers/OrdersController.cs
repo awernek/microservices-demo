@@ -1,6 +1,6 @@
 using Microsoft.AspNetCore.Mvc;
-using OrderService.Messaging;
-using OrderService.Models;
+using Contracts;
+using OrderService.Outbox;
 
 namespace OrderService.Controllers;
 
@@ -8,29 +8,31 @@ namespace OrderService.Controllers;
 [Route("[controller]")]
 public class OrdersController : ControllerBase
 {
-    private readonly IRabbitMqPublisher _publisher;
+    private readonly OutboxStore _outbox;
     private readonly ILogger<OrdersController> _logger;
 
-    public OrdersController(IRabbitMqPublisher publisher, ILogger<OrdersController> logger)
+    public OrdersController(OutboxStore outbox, ILogger<OrdersController> logger)
     {
-        _publisher = publisher;
+        _outbox = outbox;
         _logger = logger;
     }
 
     [HttpPost]
-    public async Task<IActionResult> CreateOrder([FromBody] CreateOrderRequest request)
+    public IActionResult CreateOrder([FromBody] CreateOrderRequest request)
     {
         var message = new OrderCreatedMessage
         {
-            OrderId = Guid.NewGuid(),
+            OrderId      = Guid.NewGuid(),
             CustomerName = request.CustomerName,
-            TotalAmount = request.TotalAmount,
-            CreatedAt = DateTime.UtcNow
+            TotalAmount  = request.TotalAmount,
+            CreatedAt    = DateTime.UtcNow
         };
 
-        await _publisher.PublishAsync(message);
+        // Grava no Outbox — operação local, nunca falha por indisponibilidade do RabbitMQ.
+        // O OutboxPublisher drena para o RabbitMQ de forma assíncrona em background.
+        _outbox.Enqueue(message);
 
-        _logger.LogInformation("Pedido {OrderId} publicado no RabbitMQ", message.OrderId);
+        _logger.LogInformation("Pedido {OrderId} gravado no Outbox", message.OrderId);
 
         return Accepted(new { message.OrderId, Status = "Pedido recebido e sendo processado" });
     }
