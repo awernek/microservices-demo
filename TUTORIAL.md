@@ -10,16 +10,18 @@
 2. [Conceitos Fundamentais](#2-conceitos-fundamentais)
 3. [Pré-requisitos — O que você precisa instalar](#3-pré-requisitos--o-que-você-precisa-instalar)
 4. [Etapa 1 — Criando a Estrutura do Projeto](#4-etapa-1--criando-a-estrutura-do-projeto)
-5. [Etapa 2 — OrderService (a API de Pedidos)](#5-etapa-2--orderservice-a-api-de-pedidos)
-6. [Etapa 3 — NotificationService (o Worker de Notificações)](#6-etapa-3--notificationservice-o-worker-de-notificações)
-7. [Etapa 4 — Docker e Docker Compose](#7-etapa-4--docker-e-docker-compose)
-8. [Etapa 5 — Testes Unitários](#8-etapa-5--testes-unitários)
-9. [Etapa 6 — Testes de Integração](#9-etapa-6--testes-de-integração)
-10. [Etapa 7 — Rodando o Projeto Completo](#10-etapa-7--rodando-o-projeto-completo)
-11. [Glossário](#11-glossário)
-12. [Diagrama Completo da Arquitetura](#12-diagrama-completo-da-arquitetura)
-13. [Outbox Pattern — Garantindo que Mensagens Não se Perdem](#13-outbox-pattern--garantindo-que-mensagens-não-se-perdem)
-14. [Dicas e Próximos Passos](#14-dicas-e-próximos-passos)
+5. [Etapa 2 — Contracts (o Projeto Compartilhado)](#5-etapa-2--contracts-o-projeto-compartilhado)
+6. [Etapa 3 — OrderService (a API de Pedidos)](#6-etapa-3--orderservice-a-api-de-pedidos)
+7. [Etapa 4 — NotificationService (o Dispatcher)](#7-etapa-4--notificationservice-o-dispatcher)
+8. [Etapa 5 — EmailService (Worker de E-mail)](#8-etapa-5--emailservice-worker-de-e-mail)
+9. [Etapa 6 — PushService e SmsService](#9-etapa-6--pushservice-e-smsservice)
+10. [Etapa 7 — Docker e Docker Compose](#10-etapa-7--docker-e-docker-compose)
+11. [Etapa 8 — Testes Unitários](#11-etapa-8--testes-unitários)
+12. [Etapa 9 — Testes de Integração](#12-etapa-9--testes-de-integração)
+13. [Etapa 10 — Rodando o Projeto Completo](#13-etapa-10--rodando-o-projeto-completo)
+14. [Glossário](#14-glossário)
+15. [Diagrama Completo da Arquitetura](#15-diagrama-completo-da-arquitetura)
+16. [Dicas e Próximos Passos](#16-dicas-e-próximos-passos)
 
 ---
 
@@ -32,46 +34,42 @@ Imagine que você tem uma loja online. Quando um cliente faz um pedido, você pr
 
 Agora, imagine que o envio de e-mail demora 3 segundos, o SMS às vezes falha, e a notificação push pode não chegar. Se tudo isso rodar junto no mesmo "clique" do usuário, ele vai ficar esperando uma eternidade — e se o SMS falhar, o pedido inteiro pode dar erro.
 
-**A solução?** Separar as responsabilidades em **dois programas independentes** (microserviços) que se comunicam por **mensagens**:
-
-> 💭 **Pare e pense — antes de continuar**
->
-> Você já usou um site que travou enquanto tentava te mandar um e-mail de confirmação? Ou um app que demorou para finalizar sua compra "porque algo deu errado na notificação"? Isso é o problema que estamos resolvendo aqui. A pergunta que vale refletir é: **o que acontece quando você mistura responsabilidades num só lugar?** Pense nos impactos em performance, manutenção e disponibilidade antes de ler a solução abaixo.
-
-
+**A solução?** Separar as responsabilidades em **6 programas independentes** (microserviços) que se comunicam por **mensagens**:
 
 ```text
-┌─────────────────┐         ┌──────────────┐         ┌───────────────────────┐
-│  Seu navegador   │──POST──▶│ OrderService │──msg──▶│  NotificationService  │
-│  (ou Postman)    │◀──202───│  (API Web)   │        │  (Worker em segundo   │
-└─────────────────┘         └──────────────┘         │   plano)              │
-                                                      └───────────────────────┘
-                                   ▲                           ▲
-                                   │                           │
-                                   └─────── RabbitMQ ──────────┘
-                                        (o "correio" das
-                                         mensagens)
+┌─────────────────┐         ┌──────────────┐
+│  Seu navegador   │──POST──▶│ OrderService │
+│  (ou Postman)    │◀──202───│  (API Web)   │
+└─────────────────┘         └──────┬───────┘
+                                   │ Outbox → RabbitMQ
+                                   ▼
+                          ┌──────────────────────┐
+                          │ NotificationService   │
+                          │ (Dispatcher)          │
+                          └───┬──────┬──────┬────┘
+                              │      │      │
+                    ┌─────────┘      │      └─────────┐
+                    ▼                ▼                 ▼
+             ┌────────────┐  ┌────────────┐  ┌────────────┐
+             │EmailService│  │PushService │  │ SmsService │
+             └────────────┘  └────────────┘  └────────────┘
 ```
 
-**OrderService**: recebe o pedido do cliente via HTTP, responde "recebido!" instantaneamente, e coloca uma mensagem na fila do RabbitMQ.
+- **OrderService**: recebe o pedido via HTTP, grava no **Outbox** (uma fila local) e responde "recebido!" instantaneamente. Um processo em segundo plano drena o Outbox para o RabbitMQ.
+- **NotificationService**: ouve a fila `orders`. Para cada pedido, gera 3 notificações e as roteia pelo tipo (email, push, sms) através de uma exchange.
+- **EmailService**: ouve apenas notificações do tipo `email`. Processa com retry e DLQ.
+- **PushService**: ouve apenas notificações do tipo `push`. Processa com retry e DLQ.
+- **SmsService**: ouve apenas notificações do tipo `sms`. Processa com retry e DLQ.
 
-**NotificationService**: fica o tempo todo ouvindo a fila. Quando uma mensagem chega, ele envia e-mail, SMS e push. Se falhar, tenta de novo. Se falhar demais, manda pra uma "fila de mortos" (DLQ) pra alguém resolver depois.
+**E o RabbitMQ?** É o "correio" que conecta todos eles. Funciona como uma agência dos correios: recebe mensagens de quem envia e as entrega na caixa certa de quem deve receber.
 
 ### Por que isso é útil?
 
 - **O cliente não espera**: a resposta é instantânea.
 - **Se uma notificação falhar, o pedido não falha**: são coisas separadas.
-- **Cada serviço pode escalar sozinho**: muitas notificações? Sobe mais instâncias do NotificationService. Muitos pedidos? Escala o OrderService.
-
-> ⚠️ **Armadilha comum — microserviços não são bala de prata**
->
-> Microserviços resolvem problemas de escala e independência, mas criam outros: latência de rede, consistência eventual, complexidade operacional, e muito mais código para escrever. Se você tem uma equipe pequena ou um sistema novo, um **monolito bem estruturado** pode ser a melhor escolha — e você pode migrar para microserviços quando a dor aparecer de verdade. Essa arquitetura faz sentido quando diferentes partes do sistema precisam escalar de forma independente, ter ciclos de deploy separados, ou ser mantidas por times distintos.
-
-> 🤔 **E se...?** — O que mudaria se notificações fossem síncronas?
->
-> Imagine que em vez de mensageria, o `OrderService` fizesse uma chamada HTTP direta para um `NotificationService`. Quais novos problemas surgiriam? Pense em: o que acontece se o serviço de notificação estiver fora do ar? O que acontece com o tempo de resposta do pedido? E se você quiser adicionar um 4º tipo de notificação (WhatsApp) no futuro?
-
-
+- **Cada serviço pode escalar sozinho**: muitos SMSs na fila? Sobe mais instâncias do SmsService. Muitos pedidos? Escala o OrderService.
+- **Se o RabbitMQ cair momentaneamente, nada se perde**: o Outbox segura as mensagens até que ele volte.
+- **Cada equipe pode cuidar do seu serviço**: o time de e-mail mexe no EmailService sem afetar o SMS.
 
 ---
 
@@ -85,9 +83,20 @@ Um **microserviço** é um programa pequeno e independente que faz **uma coisa b
 
 **Analogia**: pense em uma pizzaria. Em vez de uma única pessoa que faz a massa, coloca o recheio, assa e entrega, você tem especialistas: um pizzaiolo, um forno automático e um entregador. Cada um trabalha no seu ritmo.
 
+No nosso projeto, temos **6 microserviços** — cada um faz exatamente uma coisa:
+
+| Serviço | Tipo | Responsabilidade |
+|---------|------|------------------|
+| OrderService | API Web | Recebe pedidos via HTTP |
+| NotificationService | Worker | Transforma pedidos em 3 notificações e roteia |
+| EmailService | Worker | Processa notificações de e-mail |
+| PushService | Worker | Processa notificações push |
+| SmsService | Worker | Processa notificações SMS |
+| Contracts | Biblioteca | Modelos compartilhados entre todos os serviços |
+
 ### 2.2 RabbitMQ — O Carteiro das Mensagens
 
-O **RabbitMQ** é um programa que funciona como um correio. Seu OrderService escreve uma "carta" (mensagem) e coloca no correio. O NotificationService vai lá e pega a carta quando estiver pronto.
+O **RabbitMQ** é um programa que funciona como um correio. Seu OrderService escreve uma "carta" (mensagem) e coloca no correio. Os outros serviços vão lá e pegam a carta quando estiverem prontos.
 
 Conceitos do RabbitMQ que vamos usar:
 
@@ -109,34 +118,48 @@ O **Docker** empacota seu programa e tudo que ele precisa (sistema operacional, 
 **Analogia**: é como mandar uma mudança numa caixa fechada. Não importa se a pessoa vai colocar no apartamento ou na casa — dentro da caixa, tudo está organizado do mesmo jeito.
 
 - **Dockerfile**: a receita que ensina como montar a caixa.
-- **Docker Compose**: um **script de desenvolvimento local** que sobe múltiplos containers com um único comando. Não confunda com orquestração de produção — em prod você usaria Kubernetes, AWS ECS ou similar.
-
-> ⚠️ **Docker Compose ≠ arquitetura de produção**
->
-> O `docker-compose.yml` é uma ferramenta de conveniência para dev/local. Ele não faz balanceamento de carga, não reinicia containers que falham em cascata, não faz deploy incremental, e não distribui serviços entre máquinas. Em produção, você precisa de um orquestrador real (Kubernetes, ECS, etc.).
+- **Docker Compose**: o "maestro" que sobe várias caixas de uma vez (RabbitMQ + todos os serviços).
 
 ### 2.4 Padrões que vamos usar
 
 | Padrão | O que faz | Onde usamos |
 |--------|-----------|-------------|
-| **Strategy** | Define uma interface e múltiplas implementações | Handlers de notificação (Email, Push, SMS) |
+| **Outbox Pattern** | Grava a mensagem localmente antes de enviar ao broker | OrderService grava no `OutboxStore`, o `OutboxPublisher` envia ao RabbitMQ em background |
 | **Factory Method assíncrono** | Cria objetos com lógica assíncrona no construtor | `RabbitMqPublisher.CreateAsync()` |
-| **Retry com Backoff Exponencial** | Tenta de novo com esperas cada vez maiores | Filas de retry (5s, 15s, 45s) |
-| **Dead Letter Queue** | Destino para mensagens que falharam demais | `notifications.dlq` |
-| **Idempotência** | Garante que processar a mesma mensagem duas vezes não causa problemas | `IdempotencyService` |
+| **Retry com Backoff Exponencial** | Tenta de novo com esperas cada vez maiores | Filas de retry (5s, 15s, 45s) em cada serviço de notificação |
+| **Dead Letter Queue** | Destino para mensagens que falharam demais | `notifications.email.dlq`, `notifications.push.dlq`, `notifications.sms.dlq` |
+| **Idempotência** | Garante que processar a mesma mensagem duas vezes não causa problemas | `IdempotencyService` em cada serviço de notificação |
+| **Shared Contracts** | Modelos compartilhados entre serviços via projeto comum | Projeto `Contracts` |
 | **Injeção de Dependência (DI)** | Os objetos recebem suas dependências em vez de criá-las | Todo o projeto usa DI nativo do .NET |
+| **Healthcheck** | Verificação de saúde do serviço | `docker-compose` verifica se o RabbitMQ está pronto antes de subir os serviços |
 
-> 🧩 **Desafio — reconhecimento de padrões**
->
-> Antes de entrar no código, tente imaginar onde cada padrão se encaixa. Para cada linha da tabela acima, responda: "em que parte do sistema esse padrão vai aparecer e qual problema concreto ele resolve?" Por exemplo, para Idempotência: "o que acontece se a mensagem for entregue duas vezes pelo RabbitMQ?" (Isso acontece — o protocolo AMQP garante *at-least-once delivery*, não *exactly-once*.)
+### 2.5 O Padrão Outbox — Em Detalhes
 
-> 🌍 **Além do tutorial — onde esses padrões vivem**
->
-> Esses padrões não são exclusivos de mensageria. O **Retry com Backoff Exponencial** é usado por praticamente toda SDK de cloud (AWS, Azure, GCP) para chamadas HTTP. A **DLQ** existe no SQS, no Azure Service Bus, no Google Pub/Sub. O padrão **Strategy** aparece em sistemas de pagamento (PIX, cartão, boleto são estratégias intercambiáveis). **Idempotência** é fundamental em APIs REST que aceitam reprocessamento. Você vai encontrar esses conceitos muito além do RabbitMQ.
+O **Outbox Pattern** é uma das melhorias mais importantes do projeto. Imagine o cenário sem ele:
 
+```text
+1. Controller recebe pedido
+2. Controller publica no RabbitMQ ← e se o RabbitMQ estiver fora do ar?
+3. Controller retorna 202
+```
 
+Se o RabbitMQ estiver indisponível no passo 2, o pedido é **perdido**. O cliente receberia um erro 500.
 
-### 2.5 O que é uma API REST?
+Com o Outbox Pattern:
+
+```text
+1. Controller recebe pedido
+2. Controller grava no OutboxStore (fila local em memória) ← nunca falha!
+3. Controller retorna 202 imediatamente
+4. (em background) OutboxPublisher drena o OutboxStore → RabbitMQ
+5. Se falhar, tenta de novo no próximo ciclo (1 segundo)
+```
+
+O truque: **o passo 2 é uma operação local que nunca falha**. Mesmo que o RabbitMQ esteja fora do ar, o pedido fica seguro no OutboxStore e será enviado quando o RabbitMQ voltar.
+
+> **Em produção**, o OutboxStore seria uma **tabela no banco de dados** (mesma transação que salva o pedido), garantindo atomicidade total. No nosso demo, usamos `ConcurrentQueue` em memória para simplicidade.
+
+### 2.6 O que é uma API REST?
 
 Uma **API REST** é uma forma de programas se comunicarem pela internet usando HTTP (o mesmo protocolo que seu navegador usa). No nosso caso:
 
@@ -243,49 +266,42 @@ Uma **Solution** é um arquivo que agrupa todos os projetos .NET de uma aplicaç
 dotnet new sln -n microservices-demo
 ```
 
-Isso cria o arquivo `microservices-demo.sln`.
-
-### 4.5 Criar o projeto OrderService (API Web)
+### 4.5 Criar todos os projetos
 
 ```powershell
-dotnet new webapi -n OrderService -f net8.0 --no-openapi
+dotnet new classlib -n Contracts
+dotnet new webapi -n OrderService --no-openapi
+dotnet new worker -n NotificationService
+dotnet new worker -n EmailService
+dotnet new worker -n PushService
+dotnet new worker -n SmsService
+dotnet new xunit -n OrderService.Tests
+dotnet new xunit -n Integration.Tests
 ```
 
-**O que esse comando faz?**
-- `dotnet new webapi`: cria um novo projeto de API Web.
-- `-n OrderService`: o nome do projeto.
-- `--no-openapi`: não inclui Swagger (para manter simples por enquanto).
+**O que cada template faz:**
 
-### 4.6 Criar o projeto NotificationService (Worker)
+| Comando | Tipo | Para quê |
+|---------|------|----------|
+| `classlib` | Biblioteca de classes | Projeto `Contracts` — só contém modelos, sem lógica de execução |
+| `webapi` | API Web | OrderService — aceita requisições HTTP |
+| `worker` | Worker Service | Serviços de background — ficam rodando continuamente |
+| `xunit` | Projeto de testes | Testes unitários e de integração |
 
-```powershell
-dotnet new worker -n NotificationService -f net8.0
-```
-
-**O que é um Worker?** É um tipo de projeto .NET que roda como um serviço em segundo plano. Diferente de uma API (que fica esperando requisições HTTP), o Worker fica rodando continuamente, executando uma tarefa repetitiva — no nosso caso, ouvir mensagens do RabbitMQ.
-
-### 4.7 Criar o projeto de testes unitários
+### 4.6 Adicionar todos os projetos à Solution
 
 ```powershell
-dotnet new xunit -n OrderService.Tests -f net8.0
-```
-
-### 4.8 Criar o projeto de testes de integração
-
-```powershell
-dotnet new xunit -n Integration.Tests -f net8.0
-```
-
-### 4.9 Adicionar todos os projetos à Solution
-
-```powershell
+dotnet sln add Contracts/Contracts.csproj
 dotnet sln add OrderService/OrderService.csproj
 dotnet sln add NotificationService/NotificationService.csproj
+dotnet sln add EmailService/EmailService.csproj
+dotnet sln add PushService/PushService.csproj
+dotnet sln add SmsService/SmsService.csproj
 dotnet sln add OrderService.Tests/OrderService.Tests.csproj
 dotnet sln add Integration.Tests/Integration.Tests.csproj
 ```
 
-### 4.10 Verificar a estrutura
+### 4.7 Verificar a estrutura
 
 ```powershell
 dotnet sln list
@@ -296,63 +312,173 @@ Deve mostrar:
 ```text
 Projeto(s)
 ----------
+Contracts\Contracts.csproj
 OrderService\OrderService.csproj
 NotificationService\NotificationService.csproj
+EmailService\EmailService.csproj
+PushService\PushService.csproj
+SmsService\SmsService.csproj
 OrderService.Tests\OrderService.Tests.csproj
 Integration.Tests\Integration.Tests.csproj
 ```
 
-### 4.11 Estrutura de pastas até agora
+### 4.8 Estrutura de pastas final
+
+Quando terminarmos, a estrutura completa será:
 
 ```text
 microservices-demo/
 ├── .gitignore
+├── docker-compose.yml
 ├── microservices-demo.sln
+├── Contracts/
+│   ├── Contracts.csproj
+│   ├── OrderCreatedMessage.cs
+│   └── NotificationMessage.cs
 ├── OrderService/
-│   ├── OrderService.csproj
+│   ├── Controllers/OrdersController.cs
+│   ├── Messaging/
+│   │   ├── IRabbitMqPublisher.cs
+│   │   └── RabbitMqPublisher.cs
+│   ├── Outbox/
+│   │   ├── OutboxStore.cs
+│   │   └── OutboxPublisher.cs
 │   ├── Program.cs
-│   └── ... (arquivos gerados pelo template)
+│   └── Dockerfile
 ├── NotificationService/
-│   ├── NotificationService.csproj
-│   ├── Program.cs
+│   ├── Messaging/
+│   │   ├── RabbitMqTopology.cs
+│   │   └── OrderConsumer.cs
 │   ├── Worker.cs
-│   └── ...
+│   ├── Program.cs
+│   └── Dockerfile
+├── EmailService/
+│   ├── Messaging/
+│   │   ├── RabbitMqTopology.cs
+│   │   └── NotificationConsumer.cs
+│   ├── Services/
+│   │   ├── IdempotencyService.cs
+│   │   └── MetricsService.cs
+│   ├── Worker.cs
+│   ├── Program.cs
+│   └── Dockerfile
+├── PushService/
+│   └── (mesma estrutura do EmailService)
+├── SmsService/
+│   └── (mesma estrutura do EmailService)
 ├── OrderService.Tests/
-│   └── ...
+│   ├── Controllers/OrdersControllerTests.cs
+│   └── Outbox/
+│       ├── OutboxStoreTests.cs
+│       └── OutboxPublisherTests.cs
 └── Integration.Tests/
-    └── ...
+    └── OrderCreatedFlowTests.cs
 ```
 
 ---
 
-## 5. Etapa 2 — OrderService (a API de Pedidos)
+## 5. Etapa 2 — Contracts (o Projeto Compartilhado)
 
-O OrderService é o ponto de entrada do nosso sistema. Ele:
+O projeto `Contracts` contém os **modelos de dados** que são compartilhados entre os serviços. Sem ele, cada serviço teria sua própria cópia dessas classes — e se você mudasse um campo, teria que lembrar de mudar em todos os lugares.
+
+### 5.1 O .csproj do Contracts
+
+O arquivo `Contracts/Contracts.csproj` é o mais simples possível:
+
+```xml
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>
+```
+
+Note que o SDK é `Microsoft.NET.Sdk` (sem `.Web` ou `.Worker`) — é uma biblioteca pura, sem infraestrutura de execução.
+
+### 5.2 OrderCreatedMessage
+
+Apague qualquer arquivo `Class1.cs` gerado pelo template e crie `Contracts/OrderCreatedMessage.cs`:
+
+```csharp
+namespace Contracts;
+
+public class OrderCreatedMessage
+{
+    public Guid OrderId { get; set; }
+    public string CustomerName { get; set; } = string.Empty;
+    public decimal TotalAmount { get; set; }
+    public DateTime CreatedAt { get; set; }
+}
+```
+
+**Explicando cada propriedade:**
+- `OrderId`: um identificador único (GUID) para o pedido. Exemplo: `a1b2c3d4-e5f6-...`
+- `CustomerName`: o nome do cliente.
+- `TotalAmount`: o valor total do pedido (usamos `decimal` para dinheiro, nunca `float` ou `double`, porque eles perdem precisão com centavos).
+- `CreatedAt`: quando o pedido foi criado.
+
+### 5.3 NotificationMessage
+
+Crie `Contracts/NotificationMessage.cs`:
+
+```csharp
+namespace Contracts;
+
+public record NotificationMessage
+{
+    public Guid NotificationId { get; init; } = Guid.NewGuid();
+    public Guid OrderId { get; init; }
+    public string Type { get; init; } = string.Empty;      // "email" | "push" | "sms"
+    public string Recipient { get; init; } = string.Empty;
+    public string Content { get; init; } = string.Empty;
+    public int RetryCount { get; init; } = 0;
+}
+```
+
+**Por que é `record` e não `class`?**
+
+A diferença principal aqui é a palavra-chave `with`. Records permitem criar **cópias imutáveis** com valores alterados:
+
+```csharp
+var original = new NotificationMessage { Type = "email", RetryCount = 0 };
+var comRetry = original with { RetryCount = 1 };
+```
+
+Isso cria um **novo objeto** com `RetryCount = 1` e todos os outros campos iguais ao original. Usamos isso no mecanismo de retry dos serviços de notificação.
+
+**O que é `init`?** A keyword `init` permite que a propriedade seja definida apenas durante a inicialização do objeto. Depois disso, ela se torna somente leitura.
+
+### 5.4 Por que um projeto compartilhado?
+
+Em produção, contratos entre microserviços são frequentemente distribuídos como **pacotes NuGet internos**. Para o nosso demo, usar um `ProjectReference` é mais simples e atinge o mesmo objetivo: **uma única fonte de verdade** para os modelos.
+
+---
+
+## 6. Etapa 3 — OrderService (a API de Pedidos)
+
+O OrderService é o ponto de entrada do sistema. Ele:
 
 1. Recebe um pedido via HTTP POST.
-2. Publica uma mensagem no RabbitMQ.
-3. Responde "recebido!" ao cliente.
+2. Grava a mensagem no **OutboxStore** (operação local, nunca falha).
+3. Responde "recebido!" ao cliente instantaneamente.
+4. Em background, o **OutboxPublisher** drena o store e envia ao RabbitMQ.
 
-### 5.1 Instalar o pacote do RabbitMQ
-
-Navegue até a pasta do OrderService e instale o pacote:
+### 6.1 Instalar pacotes e referências
 
 ```powershell
 cd OrderService
 dotnet add package RabbitMQ.Client --version 7.2.1
-```
-
-**O que é o RabbitMQ.Client?** É a biblioteca oficial do RabbitMQ para .NET. Ela permite que nosso código C# se conecte ao RabbitMQ e envie/receba mensagens.
-
-Volte para a raiz:
-
-```powershell
+dotnet add reference ../Contracts/Contracts.csproj
 cd ..
 ```
 
-### 5.2 Verificar o .csproj
+### 6.2 Verificar o .csproj
 
-Abra o arquivo `OrderService/OrderService.csproj`. Ele deve estar assim:
+O arquivo `OrderService/OrderService.csproj` deve ficar assim:
 
 ```xml
 <Project Sdk="Microsoft.NET.Sdk.Web">
@@ -367,56 +493,24 @@ Abra o arquivo `OrderService/OrderService.csproj`. Ele deve estar assim:
     <PackageReference Include="RabbitMQ.Client" Version="7.2.1" />
   </ItemGroup>
 
+  <ItemGroup>
+    <ProjectReference Include="..\Contracts\Contracts.csproj" />
+  </ItemGroup>
+
 </Project>
 ```
 
-**Entendendo cada linha:**
-- `Sdk="Microsoft.NET.Sdk.Web"`: indica que é um projeto Web (API).
-- `<TargetFramework>net8.0</TargetFramework>`: compila para .NET 8.
-- `<Nullable>enable</Nullable>`: ativa avisos de null reference (ajuda a evitar bugs).
-- `<ImplicitUsings>enable</ImplicitUsings>`: importa automaticamente os namespaces mais comuns.
-
-### 5.3 Criar o Model — OrderCreatedMessage
-
-Primeiro, limpe os arquivos gerados pelo template que não vamos usar. Depois, crie a estrutura de pastas:
+### 6.3 Criar a estrutura de pastas
 
 ```powershell
-mkdir OrderService/Models
 mkdir OrderService/Messaging
 mkdir OrderService/Controllers
+mkdir OrderService/Outbox
 ```
 
-> **Nota:** o template pode já ter criado a pasta `Controllers`. Se sim, o comando vai simplesmente avisar que já existe.
+### 6.4 Criar a Interface — IRabbitMqPublisher
 
-Crie o arquivo `OrderService/Models/OrderCreatedMessage.cs`:
-
-```csharp
-namespace OrderService.Models;
-
-public class OrderCreatedMessage
-{
-    public Guid OrderId { get; set; }
-    public string CustomerName { get; set; } = string.Empty;
-    public decimal TotalAmount { get; set; }
-    public DateTime CreatedAt { get; set; }
-}
-```
-
-**O que é esse arquivo?**
-
-É o **modelo** da mensagem que vamos publicar no RabbitMQ. Quando alguém faz um pedido, criamos um objeto desse tipo com os dados do pedido e enviamos para a fila.
-
-**Explicando cada propriedade:**
-- `OrderId`: um identificador único (GUID) para o pedido. Exemplo: `a1b2c3d4-e5f6-...`
-- `CustomerName`: o nome do cliente.
-- `TotalAmount`: o valor total do pedido (usamos `decimal` para dinheiro, nunca `float` ou `double`, porque eles perdem precisão com centavos).
-- `CreatedAt`: quando o pedido foi criado.
-
-**Por que `= string.Empty`?** Para evitar que a propriedade seja `null`. É uma boa prática em C# moderno — quando o `<Nullable>` está ativado, o compilador avisa se você pode ter um valor nulo.
-
-### 5.4 Criar a Interface — IRabbitMqPublisher
-
-Crie o arquivo `OrderService/Messaging/IRabbitMqPublisher.cs`:
+Crie `OrderService/Messaging/IRabbitMqPublisher.cs`:
 
 ```csharp
 namespace OrderService.Messaging;
@@ -427,37 +521,11 @@ public interface IRabbitMqPublisher
 }
 ```
 
-**O que é uma interface?**
+Uma interface é como um **contrato**: "qualquer classe que me implemente precisa ter o método `PublishAsync`". Isso nos permite criar mocks para testes e trocar a implementação sem alterar quem usa.
 
+### 6.5 Criar a Implementação — RabbitMqPublisher
 
-> 💭 **Pare e pense — por que uma interface aqui?**
->
-> Imagine que você não tivesse criado `IRabbitMqPublisher` — o controller chamaria `RabbitMqPublisher` diretamente. Agora tente escrever um teste unitário para o controller sem se conectar ao RabbitMQ. Impossível, né? A interface é o que torna o código **testável**: nos testes, você injeta um *mock*; em produção, o container de DI injeta a implementação real. Isso também significa que amanhã você pode trocar o RabbitMQ por um outro broker (Kafka, Azure Service Bus) sem tocar no controller.
-
-Uma interface é como um **contrato**. Ela diz: "qualquer classe que me implemente precisa ter o método `PublishAsync`". Mas ela **não diz como** esse método funciona — isso fica para a classe concreta.
-
-**Por que usar interface?**
-
-1. **Testabilidade**: nos testes, podemos criar um "falso" (mock) que finge publicar mensagens sem precisar de RabbitMQ de verdade.
-2. **Flexibilidade**: se amanhã quisermos trocar RabbitMQ por Kafka, só precisamos criar uma nova classe que implementa `IRabbitMqPublisher`.
-
-**O que é `Task`?** `Task` indica que o método é **assíncrono** — ele pode esperar por operações demoradas (como enviar dados pela rede) sem travar o programa.
-
-**O que é `<T>`?** É um **tipo genérico** — significa que esse método aceita qualquer tipo de objeto. Assim, podemos publicar `OrderCreatedMessage`, `PaymentMessage`, ou qualquer outra classe.
-
-> 💭 **Pare e pense — por que `<T>` e não `object`?**
->
-> Você poderia escrever `PublishAsync(object message)` e funcionaria. Então para que servem os generics? A resposta está em dois lugares: **segurança de tipos** e **performance**. Com `object`, você perde a checagem em tempo de compilação — qualquer coisa passa, inclusive erros bobos. Com generics, o compilador verifica. Além disso, passar um `int` como `object` causa *boxing* (o valor é envolto em um objeto heap), o que tem custo de memória. Com `<T>`, não há boxing. Agora pense: em que situações você usaria generics em vez de uma interface? E quando uma interface seria melhor que generics?
-
-> 🌍 **Além do tutorial — generics são onipresentes**
->
-> Toda a biblioteca padrão do .NET é construída sobre generics: `List<T>`, `Dictionary<TKey, TValue>`, `Task<T>`, `IEnumerable<T>`. O padrão Repository (`IRepository<T>`) é um dos mais comuns em aplicações enterprise. Quando você vê `<T>` com uma constraint como `where T : IMessage, new()`, o compilador garante que o tipo passado satisfaça os requisitos — isso é **programação genérica com segurança de tipos em tempo de compilação**.
-
-
-
-### 5.5 Criar a Implementação — RabbitMqPublisher
-
-Crie o arquivo `OrderService/Messaging/RabbitMqPublisher.cs`:
+Crie `OrderService/Messaging/RabbitMqPublisher.cs`:
 
 ```csharp
 using System.Text;
@@ -521,97 +589,117 @@ public class RabbitMqPublisher : IRabbitMqPublisher, IAsyncDisposable
 }
 ```
 
-**Vamos entender cada parte dessa classe:**
+**Pontos importantes:**
 
-#### O construtor privado
+- **Construtor privado + `CreateAsync`**: conectar ao RabbitMQ é assíncrono, e construtores C# não suportam `async`. Então usamos o padrão Factory Method Assíncrono.
+- **`durable: true`**: a fila sobrevive a um restart do RabbitMQ.
+- **`Persistent = true`**: a mensagem é salva em disco pelo RabbitMQ.
+- **`exchange: ""`**: usa a exchange padrão, que entrega a mensagem diretamente na fila cujo nome é igual à routing key.
 
-```csharp
-private RabbitMqPublisher(IConnection connection, IChannel channel)
-```
+### 6.6 Criar o OutboxStore
 
-O construtor é `private` — isso significa que **ninguém de fora pode criar** um `RabbitMqPublisher` usando `new`. Mas por quê?
-
-Porque conectar ao RabbitMQ é uma operação **assíncrona** (usa `await`), e construtores em C# **não podem ser assíncronos**. Então usamos o padrão **Factory Method Assíncrono**.
-
-#### O Factory Method — CreateAsync
+Crie `OrderService/Outbox/OutboxStore.cs`:
 
 ```csharp
-public static async Task<RabbitMqPublisher> CreateAsync(string host, int port = 5672)
+using System.Collections.Concurrent;
+using Contracts;
+
+namespace OrderService.Outbox;
+
+public class OutboxStore
+{
+    private readonly ConcurrentQueue<OrderCreatedMessage> _queue = new();
+
+    public void Enqueue(OrderCreatedMessage message) => _queue.Enqueue(message);
+
+    public bool TryPeek(out OrderCreatedMessage? message) => _queue.TryPeek(out message);
+
+    public bool TryDequeue(out OrderCreatedMessage? message) => _queue.TryDequeue(out message);
+
+    public int Count => _queue.Count;
+}
 ```
 
-Esse é o método que realmente cria a instância. Ele:
+**O que é ConcurrentQueue?**
 
-1. Cria uma **ConnectionFactory** apontando para o host do RabbitMQ.
-2. Abre uma **conexão** assíncrona (como abrir uma linha telefônica).
-3. Cria um **canal** dentro dessa conexão (como uma conversa dentro da linha telefônica — RabbitMQ permite múltiplos canais por conexão).
-4. **Declara a fila** `orders` — isso garante que a fila existe. Se já existir, não faz nada (é **idempotente**).
+É uma fila thread-safe — múltiplos threads podem adicionar e remover itens ao mesmo tempo sem problemas. É perfeita para o Outbox: o controller adiciona, o publisher remove.
 
-**Parâmetros da fila:**
-- `durable: true` → a fila sobrevive a um restart do RabbitMQ (os dados ficam salvos em disco).
-- `exclusive: false` → outros consumidores podem se conectar a essa fila.
-- `autoDelete: false` → a fila **não** é apagada quando o último consumidor desconecta.
+**Três operações-chave:**
+- `Enqueue`: adiciona no final da fila.
+- `TryPeek`: **olha** o primeiro item **sem remover**. Crítico para o Outbox — olhamos antes de publicar.
+- `TryDequeue`: remove e retorna o primeiro item. Só chamamos **depois** de confirmar que o publish foi bem-sucedido.
 
-> 🌍 **Além do tutorial — a anatomia do padrão Factory Method**
->
-> O que fizemos aqui resolve um problema real de design: **construtores não podem ser assíncronos em C#**. Existem três soluções comuns para esse problema, cada uma com trade-offs:
->
-> **Opção A — Factory Method estático assíncrono** (o que fizemos):
-> ```csharp
-> var publisher = await RabbitMqPublisher.CreateAsync(host);
-> ```
-> Limpo, explicito, o chamador sabe que há I/O. O construtor privado impede criação acidental sem await.
->
-> **Opção B — Lazy initialization** com `Lazy<Task<T>>`:
-> ```csharp
-> private static readonly Lazy<Task<RabbitMqPublisher>> _instance =
->     new(() => CreateAsync("localhost"));
-> ```
-> Inicialização adiada — cria apenas na primeira vez que for usado. Útil quando você quer diferir a conexão.
->
-> **Opção C — Inicialização no `StartAsync` de um `IHostedService`**:
-> O serviço de hospedagem chama `StartAsync` assincronamente antes de servir requisições. Você pode conectar ali. Essa é a abordagem que o próprio `Worker` usa implicitamente via `ExecuteAsync`.
->
-> A Opção A é a mais explícita e fácil de testar — por isso foi escolhida aqui.
+### 6.7 Criar o OutboxPublisher
 
-
-
-#### O PublishAsync
+Crie `OrderService/Outbox/OutboxPublisher.cs`:
 
 ```csharp
-public async Task PublishAsync<T>(T message)
+using OrderService.Messaging;
+
+namespace OrderService.Outbox;
+
+public class OutboxPublisher : BackgroundService
+{
+    private readonly OutboxStore _store;
+    private readonly IRabbitMqPublisher _publisher;
+    private readonly ILogger<OutboxPublisher> _logger;
+
+    public OutboxPublisher(
+        OutboxStore store,
+        IRabbitMqPublisher publisher,
+        ILogger<OutboxPublisher> logger)
+    {
+        _store     = store;
+        _publisher = publisher;
+        _logger    = logger;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
+
+        while (await timer.WaitForNextTickAsync(stoppingToken))
+        {
+            while (_store.TryPeek(out var message))
+            {
+                try
+                {
+                    await _publisher.PublishAsync(message!);
+                    _store.TryDequeue(out _);
+                    _logger.LogDebug("[Outbox] Mensagem {OrderId} publicada", message!.OrderId);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning("[Outbox] Falha ao publicar {OrderId}: {Error}. Retry em 1s.",
+                        message!.OrderId, ex.Message);
+                    break;
+                }
+            }
+        }
+    }
+}
 ```
 
-Esse método:
+**A lógica crítica do Outbox:**
 
-1. **Serializa** o objeto para JSON (transforma o objeto C# em texto).
-2. **Converte** o texto JSON para bytes (porque RabbitMQ trabalha com bytes).
-3. Define `Persistent = true` → a mensagem é salva em disco pelo RabbitMQ, sobrevivendo a restarts.
-4. **Publica** na fila usando `BasicPublishAsync`:
-   - `exchange: ""` → usa a exchange padrão (default exchange), que simplesmente entrega a mensagem na fila cujo nome é igual à routing key.
-   - `routingKey: "orders"` → como a exchange é a padrão, a mensagem vai direto para a fila `orders`.
-
-#### O IAsyncDisposable
-
-```csharp
-public async ValueTask DisposeAsync()
+```text
+1. TryPeek  → olha a mensagem (sem remover)
+2. Publish  → envia ao RabbitMQ
+3. TryDequeue → só agora remove da fila (após confirmação de envio)
 ```
 
-Implementar `IAsyncDisposable` garante que, quando o serviço parar, a conexão e o canal do RabbitMQ sejam **fechados corretamente**. É como desligar o telefone ao terminar a conversa.
+**Por que TryPeek antes de TryDequeue?** Se fizéssemos `TryDequeue` antes de publicar e o RabbitMQ falhasse, a mensagem seria **perdida** — já foi removida da fila local, mas nunca chegou ao broker. Com `TryPeek`, a mensagem permanece na fila até que o envio seja confirmado.
 
-> 💭 **Pare e pense — `IDisposable` vs `IAsyncDisposable`**
->
-> O .NET tem dois contratos para liberação de recursos: `IDisposable` (com o método `Dispose()`) e `IAsyncDisposable` (com `DisposeAsync()`). A diferença é que fechar uma conexão de rede — como a do RabbitMQ — pode envolver I/O assíncrono: flush de buffers, handshake de fechamento do protocolo. Com `IDisposable`, você bloquearia o thread enquanto isso acontece. Com `IAsyncDisposable`, você usa `await` e libera o thread. O `await using` cuida de chamar `DisposeAsync()` automaticamente quando sai do escopo — da mesma forma que `using` chama `Dispose()`. Regra prática: se o objeto gerencia um recurso I/O (conexão, arquivo, stream), prefira `IAsyncDisposable`.
+**PeriodicTimer**: a cada 1 segundo, o publisher verifica se há mensagens no Outbox e tenta enviá-las. Se falhar, o `break` interrompe o dreno e tenta novamente no próximo ciclo.
 
+### 6.8 Criar o Controller — OrdersController
 
-
-### 5.6 Criar o Controller — OrdersController
-
-Se houver algum controller de exemplo gerado pelo template, apague-o. Depois, crie o arquivo `OrderService/Controllers/OrdersController.cs`:
+Se houver algum controller de exemplo gerado pelo template, apague-o. Crie `OrderService/Controllers/OrdersController.cs`:
 
 ```csharp
 using Microsoft.AspNetCore.Mvc;
-using OrderService.Messaging;
-using OrderService.Models;
+using Contracts;
+using OrderService.Outbox;
 
 namespace OrderService.Controllers;
 
@@ -619,56 +707,29 @@ namespace OrderService.Controllers;
 [Route("[controller]")]
 public class OrdersController : ControllerBase
 {
-    private readonly IRabbitMqPublisher _publisher;
+    private readonly OutboxStore _outbox;
     private readonly ILogger<OrdersController> _logger;
 
-    public OrdersController(IRabbitMqPublisher publisher, ILogger<OrdersController> logger)
+    public OrdersController(OutboxStore outbox, ILogger<OrdersController> logger)
     {
-        _publisher = publisher;
+        _outbox = outbox;
         _logger = logger;
     }
 
     [HttpPost]
-    public async Task<IActionResult> CreateOrder([FromBody] CreateOrderRequest request)
+    public IActionResult CreateOrder([FromBody] CreateOrderRequest request)
     {
         var message = new OrderCreatedMessage
         {
-            OrderId = Guid.NewGuid(),
+            OrderId      = Guid.NewGuid(),
             CustomerName = request.CustomerName,
-            TotalAmount = request.TotalAmount,
-            CreatedAt = DateTime.UtcNow
+            TotalAmount  = request.TotalAmount,
+            CreatedAt    = DateTime.UtcNow
         };
 
-        await _publisher.PublishAsync(message);
+        _outbox.Enqueue(message);
 
-        _logger.LogInformation("Pedido {OrderId} publicado no RabbitMQ", message.OrderId);
-
-> 💭 **Pare e pense — por que `{OrderId}` e não `$"...{message.OrderId}"`?**
->
-> Parece que ambos produzem a mesma string de log, mas há uma diferença fundamental. Com interpolação (`$"Pedido {message.OrderId}..."`) você cria uma string, e o logger a trata como texto opaco. Com a sintaxe de *message template* (`"Pedido {OrderId}..."`, `message.OrderId`), o logger preserva o **nome** e o **valor** como campos estruturados separados. Isso significa que sistemas como Seq, Elasticsearch, Azure Application Insights ou Datadog conseguem indexar e consultar `OrderId = "abc123"` diretamente — em vez de precisar fazer regex numa string. Você pode depois filtrar: "me mostra todos os logs onde OrderId = X" e ver o caminho inteiro da requisição. Em produção, isso é a diferença entre debugar em 2 minutos ou em 2 horas.
->
-> ```csharp
-> // ❌ Log opaco — difícil de filtrar
-> _logger.LogInformation($"Pedido {message.OrderId} publicado");
->
-> // ✅ Log estruturado — campos indexáveis
-> _logger.LogInformation("Pedido {OrderId} publicado", message.OrderId);
-> ```
-
-> 🌍 **Além do tutorial — níveis de log e quando usar cada um**
->
-> | Nível | Quando usar | Exemplo |
-> |-------|-------------|---------|
-> | `Trace` | Diagnóstico muito detalhado, só em dev | Cada byte lido/escrito |
-> | `Debug` | Fluxo interno do código, útil para debugging | Valor de variável intermediária |
-> | `Information` | Eventos normais de negócio | "Pedido {Id} publicado" |
-> | `Warning` | Situação anormal mas recuperável | "Retry {N} para notificação {Id}" |
-> | `Error` | Falha que precisa de atenção | "Falha ao processar pagamento" |
-> | `Critical` | Sistema em estado de falha grave | "Banco de dados inacessível" |
->
-> Sempre use `Warning` para retries (é esperado, mas anormal) e `Error` para falhas que vão para a DLQ. Isso permite criar alertas precisos no seu sistema de monitoramento.
-
-
+        _logger.LogInformation("Pedido {OrderId} gravado no Outbox", message.OrderId);
 
         return Accepted(new { message.OrderId, Status = "Pedido recebido e sendo processado" });
     }
@@ -677,112 +738,54 @@ public class OrdersController : ControllerBase
 public record CreateOrderRequest(string CustomerName, decimal TotalAmount);
 ```
 
-**Vamos destrinchar cada parte:**
+**Diferença importante em relação ao padrão anterior:** o controller agora é **síncrono** (`IActionResult` em vez de `async Task<IActionResult>`). Ele não precisa mais esperar o RabbitMQ — apenas grava no OutboxStore (operação em memória, instantânea) e retorna.
 
-#### Os atributos do controller
+**Os atributos do controller:**
+- `[ApiController]`: ativa validação automática do body. Se o JSON estiver inválido, o ASP.NET retorna 400 automaticamente.
+- `[Route("[controller]")]`: a URL base é `/orders` (nome do controller sem o sufixo "Controller").
+- `[HttpPost]`: responde a requisições POST.
+- `[FromBody]`: converte o JSON do corpo da requisição para `CreateOrderRequest`.
+- `Accepted()`: retorna HTTP **202** ("Aceito, estou cuidando disso em background").
 
-```csharp
-[ApiController]
-[Route("[controller]")]
-```
+### 6.9 Configurar o Program.cs do OrderService
 
-- `[ApiController]`: ativa validação automática do body da requisição. Se o JSON estiver inválido ou faltando campos, o ASP.NET retorna 400 automaticamente.
-- `[Route("[controller]")]`: define que a URL base é o nome do controller sem o sufixo "Controller". Como a classe se chama `OrdersController`, a URL base é `/orders`.
-
-#### O construtor com Injeção de Dependência
-
-```csharp
-public OrdersController(IRabbitMqPublisher publisher, ILogger<OrdersController> logger)
-```
-
-O controller **não cria** o publisher nem o logger — ele os **recebe** no construtor. Quem fornece esses objetos é o container de **Injeção de Dependência (DI)** do ASP.NET, que veremos na configuração do `Program.cs`.
-
-**Por que isso é bom?** Porque o controller não sabe (nem precisa saber) como o publisher funciona internamente. Ele só sabe que existe um método `PublishAsync`. Isso torna o código mais testável e desacoplado.
-
-#### O método CreateOrder
-
-```csharp
-[HttpPost]
-public async Task<IActionResult> CreateOrder([FromBody] CreateOrderRequest request)
-```
-
-- `[HttpPost]`: esse método responde a requisições HTTP POST.
-- `[FromBody]`: o ASP.NET pega o JSON do corpo da requisição e converte para o objeto `CreateOrderRequest`.
-- Gera um `Guid` único para o pedido.
-- Publica a mensagem no RabbitMQ.
-- Retorna HTTP **202 Accepted** (não 200 OK, porque o processamento completo ainda vai acontecer em outro serviço).
-
-> 💭 **Pare e pense — semântica HTTP importa**
->
-> A diferença entre 200 OK e 202 Accepted não é cosmética. **200** diz "terminei tudo, aqui está o resultado". **202** diz "recebi seu pedido, mas o trabalho ainda está acontecendo". Isso comunica ao cliente que ele pode precisar verificar o status depois. Quais outros códigos HTTP poderiam fazer sentido aqui? Quando você usaria 201 Created? E 204 No Content? Entender a semântica do HTTP torna suas APIs mais expressivas e autodocumentadas.
-
-
-
-#### O record CreateOrderRequest
-
-```csharp
-public record CreateOrderRequest(string CustomerName, decimal TotalAmount);
-```
-
-Um `record` é um tipo especial em C# que é **imutável por padrão** e gera automaticamente `Equals`, `GetHashCode` e `ToString`. É perfeito para DTOs (Data Transfer Objects) — objetos que só carregam dados.
-
-### 5.7 Configurar o Program.cs do OrderService
-
-Substitua todo o conteúdo do arquivo `OrderService/Program.cs` por:
+Substitua todo o conteúdo do arquivo `OrderService/Program.cs`:
 
 ```csharp
 using OrderService.Messaging;
+using OrderService.Outbox;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddControllers();
 
 var rabbitHost = builder.Configuration["RabbitMQ:Host"] ?? "localhost";
 
+builder.Services.AddSingleton<OutboxStore>();
+
 builder.Services.AddSingleton<IRabbitMqPublisher>(_ =>
     RabbitMqPublisher.CreateAsync(rabbitHost).GetAwaiter().GetResult()
 );
 
+builder.Services.AddHostedService<OutboxPublisher>();
+builder.Services.AddHealthChecks();
+
 var app = builder.Build();
 app.MapControllers();
+app.MapHealthChecks("/health");
 app.Run();
 ```
 
-**Entendendo linha por linha:**
+**Entendendo as novidades:**
 
-1. `WebApplication.CreateBuilder(args)`: cria o builder da aplicação com todas as configurações padrão (logging, configuração, DI container, etc.).
+1. **`OutboxStore` como Singleton**: uma única instância compartilhada entre o controller (que enfileira) e o OutboxPublisher (que drena).
 
-2. `builder.Services.AddControllers()`: registra o sistema de controllers MVC no container de DI. Sem isso, o ASP.NET não saberia que existem controllers.
+2. **`OutboxPublisher` como HostedService**: `AddHostedService` registra o OutboxPublisher como um `BackgroundService` que inicia automaticamente com a aplicação.
 
-3. `builder.Configuration["RabbitMQ:Host"] ?? "localhost"`: lê o host do RabbitMQ da configuração. No Docker, a variável de ambiente `RabbitMQ__Host` (com dois underscores) é automaticamente mapeada para `RabbitMQ:Host`. Se não existir, usa `"localhost"` (para rodar localmente sem Docker).
+3. **Health Checks**: `AddHealthChecks()` + `MapHealthChecks("/health")` cria um endpoint `/health` que retorna 200 se o serviço está rodando. Útil para Docker, Kubernetes e monitoramento.
 
-4. `builder.Services.AddSingleton<IRabbitMqPublisher>(...)`: registra o publisher como **Singleton** — uma única instância para toda a vida da aplicação. Isso é eficiente porque manter uma conexão RabbitMQ aberta é mais rápido do que abrir e fechar a cada requisição.
+### 6.10 Configurar o appsettings.json
 
-   > **O que é Singleton?** É um padrão de vida (lifetime) onde o container de DI cria **uma única instância** e reutiliza para todas as requisições. Outros padrões são `Scoped` (uma instância por requisição HTTP) e `Transient` (uma nova instância a cada vez que é solicitado).
-
-5. `.GetAwaiter().GetResult()`: como estamos dentro de uma factory síncrona do DI, precisamos "desembrulhar" o `Task` retornado por `CreateAsync`. Em produção, existem formas mais elegantes de fazer isso, mas para nosso demo educacional, funciona perfeitamente.
-
-> ⚠️ **Armadilha comum — `.GetAwaiter().GetResult()` pode causar deadlock**
->
-> Chamar `.GetAwaiter().GetResult()` (ou `.Result`) em uma `Task` bloqueia o thread atual até a Task completar. Em ambientes com **SynchronizationContext** (como ASP.NET clássico ou UI do WPF/WinForms), isso pode causar um **deadlock clássico**:
->
-> 1. Thread da UI chama `.GetResult()` — bloqueia esperando a Task.
-> 2. A Task, ao completar, tenta retornar no thread da UI via o SynchronizationContext.
-> 3. O thread da UI está bloqueado esperando a Task.
-> 4. Impasse — nenhum dos dois pode avançar.
->
-> **Por que funciona aqui?** O `Program.cs` de um ASP.NET Core **não tem** SynchronizationContext (diferente do ASP.NET clássico). Então o `.GetResult()` bloqueia o thread principal durante a inicialização da aplicação — que é o que queremos, porque o app não deve servir requisições antes de estar conectado ao RabbitMQ.
->
-> **A alternativa mais robusta** seria registrar o serviço como `IHostedService` e conectar no `StartAsync` — mas isso complicaria a DI. Para fins didáticos, o `.GetAwaiter().GetResult()` na configuração inicial é aceitável em ASP.NET Core.
-
-
-
-6. `app.MapControllers()`: mapeia as rotas dos controllers (como `/orders`).
-
-7. `app.Run()`: inicia o servidor e começa a aceitar requisições HTTP.
-
-### 5.8 Configurar o appsettings.json
-
-O arquivo `OrderService/appsettings.json` fica assim:
+O `OrderService/appsettings.json`:
 
 ```json
 {
@@ -796,138 +799,35 @@ O arquivo `OrderService/appsettings.json` fica assim:
 }
 ```
 
-**Entendendo:**
-- `LogLevel`: define o nível mínimo de log. `Information` mostra mensagens informativas e acima (Warning, Error). `Microsoft.AspNetCore` é configurado como `Warning` para reduzir o "barulho" de logs internos do ASP.NET.
-- `AllowedHosts: "*"`: aceita requisições de qualquer host (para desenvolvimento).
-
-> **Onde está a configuração do RabbitMQ?** Não colocamos no appsettings porque o host vem da variável de ambiente `RabbitMQ__Host` definida no Docker Compose. O fallback para `"localhost"` está no código do `Program.cs`.
-
 ---
 
-## 6. Etapa 3 — NotificationService (o Worker de Notificações)
+## 7. Etapa 4 — NotificationService (o Dispatcher)
 
-O NotificationService é mais complexo que o OrderService. Ele é um **Worker** (serviço em segundo plano) que:
+O NotificationService foi simplificado para ser um **dispatcher puro**: ele lê pedidos da fila `orders` e gera 3 notificações, roteando cada uma pelo tipo (`email`, `push`, `sms`) para o serviço correto.
 
-1. Conecta ao RabbitMQ.
-2. Ouve a fila `orders`.
-3. Para cada pedido, cria 3 notificações (e-mail, push, SMS) e publica na fila `notifications`.
-4. Ouve a fila `notifications` e processa cada notificação.
-5. Se falhar, faz retry com backoff exponencial (5s, 15s, 45s).
-6. Se esgotar os retries, manda para a DLQ (Dead Letter Queue).
-7. Garante idempotência (não processa a mesma notificação duas vezes).
-8. Coleta métricas a cada 30 segundos.
+Ele **não processa** as notificações — apenas as distribui. A lógica de retry, DLQ, idempotência e métricas agora vive nos serviços dedicados (EmailService, PushService, SmsService).
 
-### 6.1 Instalar os pacotes
+### 7.1 Instalar pacotes e referências
 
 ```powershell
 cd NotificationService
 dotnet add package RabbitMQ.Client --version 7.2.1
 dotnet add package Microsoft.Extensions.Hosting --version 8.0.1
+dotnet add reference ../Contracts/Contracts.csproj
 cd ..
 ```
 
-O pacote `Microsoft.Extensions.Hosting` fornece a infraestrutura de `BackgroundService`, logging e DI para workers.
-
-### 6.2 Criar a estrutura de pastas
+### 7.2 Criar a estrutura de pastas
 
 ```powershell
-mkdir NotificationService/Models
 mkdir NotificationService/Messaging
-mkdir NotificationService/Notifications
-mkdir NotificationService/Services
 ```
 
-### 6.3 Criar os Models
+### 7.3 Criar a Topologia — RabbitMqTopology
 
-#### OrderCreatedMessage (cópia do OrderService)
+A topologia do NotificationService é agora **mínima** — ele declara apenas a exchange compartilhada e a fila de pedidos.
 
-Crie o arquivo `NotificationService/Models/OrderCreatedMessage.cs`:
-
-```csharp
-namespace NotificationService.Models;
-
-public class OrderCreatedMessage
-{
-    public Guid OrderId { get; set; }
-    public string CustomerName { get; set; } = string.Empty;
-    public decimal TotalAmount { get; set; }
-    public DateTime CreatedAt { get; set; }
-}
-```
-
-> **Por que duplicar?** Cada microserviço é **independente** — ele não referencia o código do outro. Em projetos maiores, você poderia criar um projeto compartilhado (`Shared/Contracts`), mas para um demo com dois serviços, duplicar é mais simples e didático.
-
-> 🌍 **Além do tutorial — contratos em sistemas reais**
->
-> A duplicação que fazemos aqui é pragmática para o tutorial, mas em produção com muitos serviços você provavelmente usaria um dos seguintes: **(a)** um pacote NuGet interno com os contratos; **(b)** um schema registry (como Confluent Schema Registry para Avro/Protobuf); **(c)** um arquivo de especificação AsyncAPI descrevendo todas as mensagens. A pergunta que guia essa decisão é: **quem "possui" o contrato?** O produtor? O consumidor? Uma equipe de plataforma? A resposta muda a arquitetura.
-
-> 🧩 **Desafio — versionamento de mensagens**
->
-> Pense no seguinte cenário: você fez o deploy da nova versão do `OrderService` que agora envia `TotalAmount` como `int` (em centavos) em vez de `decimal`. Mas o `NotificationService` ainda está na versão antiga. O que acontece com as mensagens já na fila? E com as novas mensagens? Como você evitaria quebrar o sistema nesse cenário? (Pesquise sobre *additive changes* e *forward/backward compatibility* em mensageria.)
-
-
-
-#### NotificationMessage
-
-Crie o arquivo `NotificationService/Models/NotificationMessage.cs`:
-
-```csharp
-namespace NotificationService.Models;
-
-public record NotificationMessage
-{
-    public Guid NotificationId { get; init; } = Guid.NewGuid();
-    public Guid OrderId { get; init; }
-    public string Type { get; init; } = string.Empty;      // "email" | "push" | "sms"
-    public string Recipient { get; init; } = string.Empty;
-    public string Content { get; init; } = string.Empty;
-    public int RetryCount { get; init; } = 0;
-}
-```
-
-**Por que é `record` e não `class`?**
-
-A diferença principal aqui é a palavra-chave `with`. Records permitem criar **cópias imutáveis** com valores alterados. Exemplo:
-
-```csharp
-var original = new NotificationMessage { Type = "email", RetryCount = 0 };
-var comRetry = original with { RetryCount = 1 };
-```
-
-Isso cria um **novo objeto** com `RetryCount = 1` e todos os outros campos iguais ao original. Usamos isso no mecanismo de retry.
-
-**O que é `init`?** A keyword `init` permite que a propriedade seja definida apenas durante a inicialização do objeto (no construtor ou na criação com `new`). Depois disso, ela se torna somente leitura.
-
-> 💭 **Pare e pense — `record` vs `class` vs `struct`**
->
-> C# tem três formas principais de definir tipos de dados. Escolher a errada não quebra o código imediatamente, mas cria armadilhas sutis:
->
-> | | `struct` | `class` | `record` |
-> |---|---|---|---|
-> | Onde vive na memória | Stack (geralmente) | Heap | Heap |
-> | Igualdade padrão | Por valor | Por referência | Por valor dos campos |
-> | Imutabilidade | Possível | Manual | Primeiro cidadão (com `init`) |
-> | Cópia não-destrutiva (`with`) | Sim (C# 10+) | Não | Sim |
-> | Melhor para | Tipos pequenos, numéricos | Objetos com identidade e estado | DTOs, mensagens, eventos |
->
-> O ponto crítico da igualdade: dois `record` com os mesmos campos são **iguais** (`==` retorna `true`). Dois objetos `class` com os mesmos campos são **diferentes** (são duas instâncias distintas na heap). Isso importa muito para coleções, comparações e testes. Quando você tem um `NotificationMessage` processado duas vezes, o `ConcurrentDictionary` de idempotência funciona com o `NotificationId` (um `Guid`, tipo valor) — não com a mensagem inteira. Se estivesse usando a mensagem como chave, a diferença entre `record` e `class` seria crítica.
-
-> 🧩 **Desafio — imutabilidade na prática**
->
-> Tente modificar o `RetryCount` de uma `NotificationMessage` diretamente:
-> ```csharp
-> var msg = new NotificationMessage { RetryCount = 0 };
-> msg.RetryCount = 1; // Isso compila?
-> ```
-> Não compila — `init` impede. Agora, por que isso é uma vantagem no contexto de mensageria? Pense no que aconteceria se dois threads processando a mesma mensagem pudessem mutar o `RetryCount` simultaneamente.
-
-
-
-### 6.4 Criar a Topologia do RabbitMQ — RabbitMqTopology
-
-Essa classe declara toda a "infraestrutura" de filas e exchanges que o NotificationService precisa.
-
-Crie o arquivo `NotificationService/Messaging/RabbitMqTopology.cs`:
+Crie `NotificationService/Messaging/RabbitMqTopology.cs`:
 
 ```csharp
 using RabbitMQ.Client;
@@ -937,12 +837,6 @@ namespace NotificationService.Messaging;
 public static class RabbitMqTopology
 {
     public const string NotificationsExchange = "notifications.exchange";
-    public const string RetryExchange         = "notifications.retry.exchange";
-
-    public const string NotificationsQueue = "notifications";
-    public const string DlqQueue           = "notifications.dlq";
-
-    public static readonly int[] RetryDelaysMs = [5_000, 15_000, 45_000];
 
     public static async Task DeclareAsync(IChannel channel)
     {
@@ -950,53 +844,6 @@ public static class RabbitMqTopology
             exchange: NotificationsExchange,
             type: ExchangeType.Direct,
             durable: true
-        );
-
-        await channel.ExchangeDeclareAsync(
-            exchange: RetryExchange,
-            type: ExchangeType.Direct,
-            durable: true
-        );
-
-        await channel.QueueDeclareAsync(
-            queue: NotificationsQueue,
-            durable: true,
-            exclusive: false,
-            autoDelete: false
-        );
-        await channel.QueueBindAsync(
-            queue: NotificationsQueue,
-            exchange: NotificationsExchange,
-            routingKey: "notification"
-        );
-
-        for (int i = 0; i < RetryDelaysMs.Length; i++)
-        {
-            var retryQueue = $"notifications.retry.{i + 1}";
-            await channel.QueueDeclareAsync(
-                queue: retryQueue,
-                durable: true,
-                exclusive: false,
-                autoDelete: false,
-                arguments: new Dictionary<string, object?>
-                {
-                    ["x-message-ttl"]             = RetryDelaysMs[i],
-                    ["x-dead-letter-exchange"]    = NotificationsExchange,
-                    ["x-dead-letter-routing-key"] = "notification"
-                }
-            );
-            await channel.QueueBindAsync(
-                queue: retryQueue,
-                exchange: RetryExchange,
-                routingKey: $"retry.{i + 1}"
-            );
-        }
-
-        await channel.QueueDeclareAsync(
-            queue: DlqQueue,
-            durable: true,
-            exclusive: false,
-            autoDelete: false
         );
 
         await channel.QueueDeclareAsync(
@@ -1009,96 +856,16 @@ public static class RabbitMqTopology
 }
 ```
 
-**Essa é a parte mais complexa do RabbitMQ. Vamos entender o fluxo completo:**
+**Exchange Direct**: entrega a mensagem para filas cuja binding corresponde à routing key. Quando publicamos com `routingKey: "email"`, apenas filas que fizeram binding com routing key `"email"` recebem a mensagem.
 
-#### Diagrama da topologia
+### 7.4 Criar o OrderConsumer
 
-```text
-              ┌─────────────────────────────┐
-              │     notifications.exchange   │
-              │         (DIRECT)             │
-              └───────────┬─────────────────┘
-                          │ routing key: "notification"
-                          ▼
-              ┌─────────────────────────────┐
-              │     notifications (fila)    │◄──── mensagens novas
-              │                             │◄──── mensagens que voltaram do retry
-              └───────────┬─────────────────┘
-                          │ consumer lê
-                          ▼
-                   ┌──────────────┐
-                   │   Sucesso?   │
-                   └──────┬───────┘
-                     Sim  │   Não
-                     │    │
-                     ▼    ▼
-                   [OK] ┌─────────────────┐
-                        │ RetryCount < 3? │
-                        └───────┬─────────┘
-                          Sim   │   Não
-                          │     │
-                          ▼     ▼
-  ┌────────────────────────┐  ┌─────────────────────┐
-  │ notifications.retry.   │  │  notifications.dlq  │
-  │ exchange (DIRECT)      │  │  (fila final)       │
-  └───────────┬────────────┘  └─────────────────────┘
-              │ routing key:
-              │ "retry.1" / "retry.2" / "retry.3"
-              ▼
-  ┌──────────────────────────┐
-  │ notifications.retry.1    │ ← TTL 5s (espera 5 segundos)
-  │ notifications.retry.2    │ ← TTL 15s (espera 15 segundos)
-  │ notifications.retry.3    │ ← TTL 45s (espera 45 segundos)
-  └──────────┬───────────────┘
-             │ quando o TTL expira, o RabbitMQ
-             │ automaticamente move para:
-             │ x-dead-letter-exchange = notifications.exchange
-             │ x-dead-letter-routing-key = "notification"
-             ▼
-  ┌─────────────────────────┐
-  │  notifications (fila)   │  ← volta para a fila principal!
-  └─────────────────────────┘
-```
-
-#### O que é Backoff Exponencial?
-
-Quando uma notificação falha, não tentamos de novo imediatamente. Esperamos:
-- **1ª falha**: 5 segundos
-- **2ª falha**: 15 segundos (3x mais)
-- **3ª falha**: 45 segundos (3x mais)
-
-Se ainda falhar após 3 retries, vai para a DLQ. Isso é chamado de **backoff exponencial** — a espera cresce exponencialmente, dando tempo para o problema (servidor de e-mail fora do ar, por exemplo) se resolver.
-
-> 🤔 **E se...?** — Intervalos fixos vs. backoff exponencial
->
-> Imagine que você tem 10.000 mensagens falhando ao mesmo tempo porque um servidor externo ficou instável por 2 minutos. Com retry imediato, você bombardeia o servidor no instante em que ele volta — e provavelmente o derruba de novo. Com intervalos fixos de 5s, você ainda cria uma "onda" de requisições. Com backoff exponencial, as tentativas ficam espalhadas no tempo. Agora pense: o que aconteceria se você também adicionasse um **jitter** (variação aleatória) ao intervalo? Procure por "thundering herd problem" e "retry jitter" para entender por que sistemas de produção usam os dois juntos.
-
-> ⚠️ **Armadilha comum — retry infinito**
->
-> Nunca faça retry infinito. Sem um limite, uma mensagem "envenenada" (com dados que sempre causam erro) vai ficar tentando para sempre, consumindo recursos. A DLQ existe exatamente para isso: isolar mensagens que falharam além do limite, permitindo que um humano analise e decida o que fazer. Sempre defina um `maxRetries` e sempre tenha uma DLQ.
-
-
-
-#### Como o TTL funciona?
-
-As filas de retry têm `x-message-ttl` — um tempo máximo que a mensagem pode ficar na fila. Quando esse tempo expira, o RabbitMQ automaticamente move a mensagem para o `x-dead-letter-exchange` com o `x-dead-letter-routing-key` configurado. É assim que a mensagem "volta" para a fila principal após esperar.
-
-> 🌍 **Além do tutorial — esse padrão tem nome**
->
-> O que você acabou de implementar é o padrão **"Retry Queue with Dead Letter"**. É a forma canônica de retry em sistemas de mensageria e existe nos principais brokers do mercado (AWS SQS tem Visibility Timeout + DLQ, Azure Service Bus tem Lock Duration + Dead Letter Queue). A mecânica do TTL + dead-letter é elegante porque o retry é **passivo**: o RabbitMQ cuida do timing, você não precisa de um scheduler externo nem de um banco de dados de "tentativas pendentes".
-
-
-
-### 6.5 Criar o OrderConsumer
-
-Esse consumer lê pedidos da fila `orders` e gera 3 notificações para cada pedido.
-
-Crie o arquivo `NotificationService/Messaging/OrderConsumer.cs`:
+Crie `NotificationService/Messaging/OrderConsumer.cs`:
 
 ```csharp
 using System.Text;
 using System.Text.Json;
-using NotificationService.Models;
+using Contracts;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 
@@ -1141,25 +908,6 @@ public class OrderConsumer
         var json = Encoding.UTF8.GetString(args.Body.ToArray());
         var order = JsonSerializer.Deserialize<OrderCreatedMessage>(json)!;
 
-> ⚠️ **Armadilha comum — o operador `!` (null-forgiving)**
->
-> O `!` no final de `Deserialize<OrderCreatedMessage>(json)!` diz ao compilador: "eu sei que isso pode ser `null`, mas garanto que não será — pode parar de me avisar". É um silenciador de warnings, não uma proteção em runtime. Se o JSON chegar malformado ou vazio, `Deserialize` vai retornar `null`, o `!` não vai fazer nada, e você vai ter uma `NullReferenceException` em runtime.
->
-> Em código de produção, você deve tratar essa possibilidade explicitamente:
-> ```csharp
-> var order = JsonSerializer.Deserialize<OrderCreatedMessage>(json);
-> if (order is null)
-> {
->     _logger.LogError("Mensagem inválida na fila — JSON não pôde ser desserializado");
->     await _channel.BasicAckAsync(args.DeliveryTag, multiple: false);
->     return;
-> }
-> ```
->
-> No tutorial, o `!` é aceitável porque controlamos o produtor — sabemos que o JSON será sempre válido. Mas num sistema real onde diferentes produtores publicam na fila, validação defensiva é obrigatória.
-
-
-
         var notifications = new[]
         {
             new NotificationMessage
@@ -1192,7 +940,7 @@ public class OrderConsumer
 
             await _publishChannel.BasicPublishAsync(
                 exchange: RabbitMqTopology.NotificationsExchange,
-                routingKey: "notification",
+                routingKey: notification.Type,
                 mandatory: false,
                 basicProperties: props,
                 body: body
@@ -1200,7 +948,7 @@ public class OrderConsumer
         }
 
         _logger.LogInformation(
-            "[OrderConsumer] Pedido {OrderId} → {Count} notificações despachadas",
+            "[OrderConsumer] Pedido {OrderId} → {Count} notificações despachadas (email, push, sms)",
             order.OrderId,
             notifications.Length
         );
@@ -1210,600 +958,31 @@ public class OrderConsumer
 }
 ```
 
-**Pontos importantes:**
+**A mudança mais importante em relação à versão anterior:** a routing key agora é **dinâmica** — `routingKey: notification.Type`. Isso significa:
 
-- **`BasicQosAsync(prefetchCount: 1)`**: diz ao RabbitMQ para enviar **uma mensagem por vez** para este consumer. Isso garante que processamos um pedido de cada vez, o que é importante porque cada pedido gera 3 notificações.
+- Notificação do tipo `"email"` → routing key `"email"` → vai para a fila `notifications.email` do EmailService.
+- Notificação do tipo `"push"` → routing key `"push"` → vai para a fila `notifications.push` do PushService.
+- Notificação do tipo `"sms"` → routing key `"sms"` → vai para a fila `notifications.sms` do SmsService.
 
-> 💭 **Pare e pense — o modelo de concorrência do `prefetchCount`**
->
-> O `prefetchCount` é um dos parâmetros mais impactantes em performance e corretude de consumers RabbitMQ. Pense nele como o controle de "quantos pratos posso ter na mão ao mesmo tempo":
->
-> - `prefetchCount: 1` (OrderConsumer): só pega o próximo pedido quando terminar o atual. Garante **ordem de processamento** e evita que um consumer sobrecarregue ao receber muitos pedidos de uma vez. Certo aqui porque cada pedido dispara 3 publicações — se você pegar 10 pedidos de uma vez, dispara 30 publicações simultâneas.
->
-> - `prefetchCount: 5` (NotificationConsumer): pode processar até 5 notificações em paralelo. Isso é possível porque cada notificação é **independente** — o sucesso de uma não afeta as outras.
->
-> - `prefetchCount: 0` (ilimitado): o RabbitMQ envia **todas** as mensagens disponíveis de uma vez. Perigoso: se o serviço cair, todas essas mensagens não receberam Ack e voltam para a fila, potencialmente sendo reprocessadas por outros consumers.
->
-> A escolha de `prefetchCount` define seu **throughput** (capacidade de processamento) vs **risco de reprocessamento**. Em produção, ajuste baseado em benchmarks reais do seu sistema.
+Cada serviço faz o binding da sua fila na `notifications.exchange` com a routing key correspondente ao seu tipo.
 
+### 7.5 Criar o Worker
 
-
-- **`autoAck: false`**: não confirmamos automaticamente o recebimento. A confirmação (`BasicAckAsync`) é feita **manualmente** após processar com sucesso. Se o serviço cair antes do ack, o RabbitMQ reenvia a mensagem para outro consumer (ou para o mesmo quando ele voltar).
-
-- **Canais separados** (`_consumeChannel` e `_publishChannel`): RabbitMQ recomenda usar canais separados para consumir e publicar. Misturar operações no mesmo canal pode causar problemas de performance.
-
-- **Geração do destinatário**: estamos simulando — em produção, os dados viriam de um banco de dados do cliente.
-
-### 6.6 Criar o NotificationConsumer
-
-Esse é o consumer mais complexo. Ele processa as notificações com retry, DLQ e idempotência.
-
-Crie o arquivo `NotificationService/Messaging/NotificationConsumer.cs`:
-
-```csharp
-using System.Diagnostics;
-using System.Text;
-using System.Text.Json;
-using NotificationService.Models;
-using NotificationService.Notifications;
-using NotificationService.Services;
-using RabbitMQ.Client;
-using RabbitMQ.Client.Events;
-
-namespace NotificationService.Messaging;
-
-public class NotificationConsumer
-{
-    private readonly IChannel _consumeChannel;
-    private readonly IChannel _publishChannel;
-    private readonly SemaphoreSlim _publishLock = new(1, 1);
-    private readonly Dictionary<string, INotificationHandler> _handlers;
-    private readonly IdempotencyService _idempotency;
-    private readonly MetricsService _metrics;
-    private readonly ILogger _logger;
-
-    private const int MaxRetries = 3;
-
-    public NotificationConsumer(
-        IChannel consumeChannel,
-        IChannel publishChannel,
-        IEnumerable<INotificationHandler> handlers,
-        IdempotencyService idempotency,
-        MetricsService metrics,
-        ILogger logger)
-    {
-        _consumeChannel = consumeChannel;
-        _publishChannel = publishChannel;
-        _handlers       = handlers.ToDictionary(h => h.Type);
-        _idempotency    = idempotency;
-        _metrics        = metrics;
-        _logger         = logger;
-    }
-
-    public async Task StartAsync(CancellationToken ct)
-    {
-        await _consumeChannel.BasicQosAsync(
-            prefetchSize: 0, prefetchCount: 5, global: false, cancellationToken: ct
-        );
-
-        var consumer = new AsyncEventingBasicConsumer(_consumeChannel);
-        consumer.ReceivedAsync += HandleNotificationAsync;
-
-        await _consumeChannel.BasicConsumeAsync(
-            queue: RabbitMqTopology.NotificationsQueue,
-            autoAck: false,
-            consumer: consumer,
-            cancellationToken: ct
-        );
-
-        _logger.LogInformation(
-            "[NotificationConsumer] Aguardando notificações... (prefetch: 5, max retries: {Max})",
-            MaxRetries
-        );
-    }
-
-    private async Task HandleNotificationAsync(object _, BasicDeliverEventArgs args)
-    {
-        var json    = Encoding.UTF8.GetString(args.Body.ToArray());
-        var message = JsonSerializer.Deserialize<NotificationMessage>(json)!;
-        var sw      = Stopwatch.StartNew();
-
-        if (_idempotency.AlreadyProcessed(message.NotificationId))
-        {
-            _logger.LogWarning(
-                "[DUPLICATA] Notificação {Id} ({Type}) já processada. Descartando.",
-                message.NotificationId, message.Type
-            );
-            _metrics.RecordDuplicate();
-            await _consumeChannel.BasicAckAsync(args.DeliveryTag, multiple: false);
-            return;
-        }
-
-        if (!_handlers.TryGetValue(message.Type, out var handler))
-        {
-            _logger.LogError(
-                "[ERRO] Nenhum handler para o tipo '{Type}'. Descartando.", message.Type
-            );
-            await _consumeChannel.BasicAckAsync(args.DeliveryTag, multiple: false);
-            return;
-        }
-
-        try
-        {
-            await handler.HandleAsync(message);
-
-            sw.Stop();
-            _idempotency.Register(message.NotificationId);
-            _metrics.RecordSuccess(message.Type, sw.ElapsedMilliseconds);
-
-            await _consumeChannel.BasicAckAsync(args.DeliveryTag, multiple: false);
-        }
-        catch (Exception ex)
-        {
-            sw.Stop();
-            _metrics.RecordFailure(message.Type);
-
-            if (message.RetryCount < MaxRetries)
-            {
-                var retryNumber = message.RetryCount + 1;
-                var delayMs     = RabbitMqTopology.RetryDelaysMs[message.RetryCount];
-
-                _logger.LogWarning(
-                    "[RETRY {Attempt}/{Max}] {Type} falhou: {Error}. Aguardando {Delay}s.",
-                    retryNumber, MaxRetries, message.Type, ex.Message, delayMs / 1000
-                );
-
-                await PublishToRetryAsync(message with { RetryCount = retryNumber }, retryNumber);
-            }
-            else
-            {
-                _logger.LogError(
-                    "[DLQ] {Type} falhou após {Max} tentativas. Notificação {Id} enviada para DLQ. Erro: {Error}",
-                    message.Type, MaxRetries, message.NotificationId, ex.Message
-                );
-
-                _metrics.RecordDlq();
-                await PublishToDlqAsync(message, ex.Message);
-            }
-
-            await _consumeChannel.BasicAckAsync(args.DeliveryTag, multiple: false);
-        }
-    }
-
-    private async Task PublishToRetryAsync(NotificationMessage message, int retryNumber)
-    {
-        var body  = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(message));
-        var props = new BasicProperties { Persistent = true };
-
-        await _publishLock.WaitAsync();
-        try
-        {
-            await _publishChannel.BasicPublishAsync(
-                exchange: RabbitMqTopology.RetryExchange,
-                routingKey: $"retry.{retryNumber}",
-                mandatory: false,
-                basicProperties: props,
-                body: body
-            );
-        }
-        finally { _publishLock.Release(); }
-    }
-
-    private async Task PublishToDlqAsync(NotificationMessage message, string errorReason)
-    {
-        var envelope = new { message, errorReason, failedAt = DateTime.UtcNow };
-        var body     = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(envelope));
-        var props    = new BasicProperties { Persistent = true };
-
-        await _publishLock.WaitAsync();
-        try
-        {
-            await _publishChannel.BasicPublishAsync(
-                exchange: "",
-                routingKey: RabbitMqTopology.DlqQueue,
-                mandatory: false,
-                basicProperties: props,
-                body: body
-            );
-        }
-        finally { _publishLock.Release(); }
-    }
-}
-```
-
-**Pontos-chave que merecem atenção:**
-
-#### O SemaphoreSlim
-
-```csharp
-private readonly SemaphoreSlim _publishLock = new(1, 1);
-```
-
-O `BasicPublishAsync` do RabbitMQ **não é thread-safe** — se dois threads tentarem publicar ao mesmo tempo no mesmo canal, pode dar problema. O `SemaphoreSlim` garante que apenas **uma publicação aconteça por vez** no canal de publicação. Funciona como um cadeado: antes de publicar, "tranca" (`WaitAsync`); depois, "destranca" (`Release`).
-
-> 💭 **Pare e pense — as ferramentas de sincronização no .NET**
->
-> Concorrência em C# tem várias ferramentas, cada uma para um caso específico. Usar a errada pode gerar deadlocks, race conditions ou — o pior — código que *parece* funcionar mas falha aleatoriamente em produção:
->
-> | Ferramenta | Quando usar | Por que não usar `lock` aqui? |
-> |---|---|---|
-> | `lock` | Seções críticas **síncronas** | `lock` não funciona com `await` dentro dele. O compilador até aceita, mas libera o lock **antes** do `await` completar. |
-> | `SemaphoreSlim(1,1)` | Seções críticas **assíncronas** (com await) | ✅ A escolha certa para `BasicPublishAsync` |
-> | `Interlocked` | Operações atômicas simples em primitivos (`int`, `long`) | Não serve para proteger blocos de código, só para operações únicas |
-> | `ConcurrentDictionary` | Leitura/escrita concorrente em dicionários | Garante atomicidade por operação, não por sequência de operações |
-> | `Channel<T>` | Produtor/consumidor assíncronos de alta performance | Alternativa moderna ao `SemaphoreSlim` quando o padrão é enfileirar trabalho |
->
-> A regra de ouro: **nunca use `lock` + `await` no mesmo bloco**. Se precisar proteger código assíncrono, use `SemaphoreSlim`.
-
-
-
-#### O padrão Strategy para handlers
-
-```csharp
-_handlers = handlers.ToDictionary(h => h.Type);
-```
-
-Recebemos **todos os handlers** como `IEnumerable<INotificationHandler>` (o container de DI injeta os três: email, push, sms) e criamos um dicionário indexado por tipo. Assim, para processar uma notificação do tipo `"email"`, basta fazer:
-
-> 🌍 **Além do tutorial — a anatomia completa do padrão Strategy**
->
-> O padrão Strategy do GoF (Gang of Four) tem três participantes:
->
-> 1. **Interface (Strategy)**: `INotificationHandler` — define o contrato que todas as estratégias devem seguir.
-> 2. **Implementações concretas (ConcreteStrategy)**: `EmailNotificationHandler`, `PushNotificationHandler`, `SmsNotificationHandler` — cada uma implementa o algoritmo de forma diferente.
-> 3. **Contexto (Context)**: `NotificationConsumer` — usa a estratégia sem saber qual é. Ele só chama `handler.HandleAsync(message)`.
->
-> **Compare com a alternativa sem Strategy:**
-> ```csharp
-> // ❌ Sem Strategy — frágil e difícil de extender
-> switch (message.Type)
-> {
->     case "email":
->         await Task.Delay(100); // lógica de email aqui
->         break;
->     case "push":
->         await Task.Delay(50);  // lógica de push aqui
->         break;
->     case "sms":
->         await Task.Delay(200); // lógica de sms aqui
->         break;
->     default:
->         throw new InvalidOperationException($"Tipo desconhecido: {message.Type}");
-> }
-> ```
-> Para adicionar WhatsApp, você precisaria mexer nesse `switch` — abrindo risco de quebrar o que já funciona. Com Strategy, você cria `WhatsAppNotificationHandler`, registra no DI, e o `NotificationConsumer` **nem sabe que existe** — funciona automaticamente. Isso é o **Princípio Aberto/Fechado** (Open/Closed Principle, o "O" do SOLID): aberto para extensão, fechado para modificação.
-
-> 🧩 **Desafio — adicione um novo canal sem tocar no consumer**
->
-> Crie um `WhatsAppNotificationHandler` que implementa `INotificationHandler` com `Type = "whatsapp"`, simula uma falha de 25% e um delay de 80ms. Registre-o no `Program.cs`. Agora modifique o `OrderConsumer` para criar uma 4ª notificação do tipo `"whatsapp"` para cada pedido. O `NotificationConsumer` deve lidar com ela automaticamente — sem nenhuma mudança. Se precisar alterar o `NotificationConsumer` para fazer isso funcionar, o Strategy não foi implementado corretamente.
-
-
-
-```csharp
-_handlers.TryGetValue(message.Type, out var handler)
-```
-
-#### O fluxo de retry
-
-```csharp
-if (message.RetryCount < MaxRetries)
-{
-    await PublishToRetryAsync(message with { RetryCount = retryNumber }, retryNumber);
-}
-```
-
-Quando uma notificação falha:
-1. Se `RetryCount < 3`, cria uma cópia da mensagem com `RetryCount + 1` e publica na fila de retry correspondente.
-2. A fila de retry tem um TTL. Quando o TTL expira, o RabbitMQ automaticamente devolve a mensagem para a fila principal.
-3. O consumer processa novamente. Se falhar de novo, incrementa o retry e repete.
-
-#### Por que Ack mesmo em falha?
-
-```csharp
-await _consumeChannel.BasicAckAsync(args.DeliveryTag, multiple: false);
-```
-
-Mesmo quando a notificação falha, damos Ack (confirmação). Parece estranho, mas faz sentido: nós mesmos cuidamos do retry publicando uma **nova mensagem** na fila de retry. Se usássemos `Nack` (rejeição), o RabbitMQ recolocaria a mensagem original na fila imediatamente, sem respeitar o backoff.
-
-> 🌍 **Além do tutorial — o vocabulário completo do AMQP: Ack, Nack e Reject**
->
-> O protocolo AMQP oferece três respostas possíveis para uma mensagem recebida:
->
-> | Comando | Significado | `requeue` | Quando usar |
-> |---------|-------------|-----------|-------------|
-> | `BasicAck` | "Processei com sucesso, pode descartar" | — | Sempre que o processamento terminou (mesmo que você mesmo encaminhou para retry) |
-> | `BasicNack` | "Não processei, devolve para a fila" | `true` → volta imediatamente | Quando você quer que o RabbitMQ reentregue *agora* (sem delay) a outro consumer |
-> | `BasicReject` | "Rejeito definitivamente esta mensagem" | `false` → vai para DLQ (se configurada) | Mensagem corrompida ou inválida que nunca poderá ser processada |
->
-> **A armadilha do Nack com requeue=true**: se a mensagem falhar por um bug no código (não por instabilidade externa), o `Nack` com requeue vai criar um loop infinito: a mensagem volta imediatamente, falha de novo, volta, falha... até esgotar o RabbitMQ. Por isso nosso sistema de retry é manual: damos **Ack** (removemos da fila original) e publicamos uma **nova mensagem** na fila de retry com o `RetryCount` incrementado. Temos controle total sobre o fluxo.
-
-
-
-### 6.7 Criar a Interface e os Handlers de Notificação
-
-#### INotificationHandler
-
-Crie o arquivo `NotificationService/Notifications/INotificationHandler.cs`:
-
-```csharp
-using NotificationService.Models;
-
-namespace NotificationService.Notifications;
-
-public interface INotificationHandler
-{
-    string Type { get; }
-    Task HandleAsync(NotificationMessage message);
-}
-```
-
-Cada handler tem um `Type` (ex: `"email"`) que é usado para rotear a mensagem para o handler correto.
-
-#### EmailNotificationHandler
-
-Crie o arquivo `NotificationService/Notifications/EmailNotificationHandler.cs`:
-
-```csharp
-using NotificationService.Models;
-
-namespace NotificationService.Notifications;
-
-public class EmailNotificationHandler : INotificationHandler
-{
-    private readonly ILogger<EmailNotificationHandler> _logger;
-
-    public string Type => "email";
-
-    public EmailNotificationHandler(ILogger<EmailNotificationHandler> logger) => _logger = logger;
-
-    public async Task HandleAsync(NotificationMessage message)
-    {
-        await Task.Delay(Random.Shared.Next(50, 150));
-
-        if (Random.Shared.NextDouble() < 0.30)
-            throw new InvalidOperationException(
-                $"Servidor SMTP indisponível para '{message.Recipient}'"
-            );
-
-        _logger.LogInformation(
-            "[EMAIL] Enviado para {Recipient} | Pedido {OrderId}",
-            message.Recipient, message.OrderId
-        );
-    }
-}
-```
-
-**O que está acontecendo aqui?**
-
-Esse handler **simula** o envio de um e-mail:
-
-1. `Task.Delay(Random.Shared.Next(50, 150))`: simula a latência de um servidor SMTP real (entre 50ms e 150ms).
-2. `Random.Shared.NextDouble() < 0.30`: **30% de chance de falhar**. Isso é proposital — queremos ver o mecanismo de retry funcionando. Em produção, você usaria uma biblioteca real de e-mail (como SendGrid ou MailKit).
-
-**Em produção**, esse handler se conectaria a um servidor SMTP ou a uma API como SendGrid e enviaria o e-mail de verdade.
-
-#### PushNotificationHandler
-
-Crie o arquivo `NotificationService/Notifications/PushNotificationHandler.cs`:
-
-```csharp
-using NotificationService.Models;
-
-namespace NotificationService.Notifications;
-
-public class PushNotificationHandler : INotificationHandler
-{
-    private readonly ILogger<PushNotificationHandler> _logger;
-
-    public string Type => "push";
-
-    public PushNotificationHandler(ILogger<PushNotificationHandler> logger) => _logger = logger;
-
-    public async Task HandleAsync(NotificationMessage message)
-    {
-        await Task.Delay(Random.Shared.Next(20, 80));
-
-        if (Random.Shared.NextDouble() < 0.20)
-            throw new InvalidOperationException(
-                $"Token de dispositivo expirado para '{message.Recipient}'"
-            );
-
-        _logger.LogInformation(
-            "[PUSH] Enviado para {Recipient} | Pedido {OrderId}",
-            message.Recipient, message.OrderId
-        );
-    }
-}
-```
-
-**20% de chance de falhar** — simula um token de push notification expirado (acontece quando o usuário desinstala o app).
-
-#### SmsNotificationHandler
-
-Crie o arquivo `NotificationService/Notifications/SmsNotificationHandler.cs`:
-
-```csharp
-using NotificationService.Models;
-
-namespace NotificationService.Notifications;
-
-public class SmsNotificationHandler : INotificationHandler
-{
-    private readonly ILogger<SmsNotificationHandler> _logger;
-
-    public string Type => "sms";
-
-    public SmsNotificationHandler(ILogger<SmsNotificationHandler> logger) => _logger = logger;
-
-    public async Task HandleAsync(NotificationMessage message)
-    {
-        await Task.Delay(Random.Shared.Next(100, 300));
-
-        if (Random.Shared.NextDouble() < 0.40)
-            throw new InvalidOperationException(
-                $"Operadora indisponível para '{message.Recipient}'"
-            );
-
-        _logger.LogInformation(
-            "[SMS] Enviado para {Recipient} | Pedido {OrderId}",
-            message.Recipient, message.OrderId
-        );
-    }
-}
-```
-
-**40% de chance de falhar** — SMS é historicamente o canal menos confiável, por isso tem a maior taxa de falha simulada.
-
-### 6.8 Criar os Serviços de Suporte
-
-#### IdempotencyService
-
-Crie o arquivo `NotificationService/Services/IdempotencyService.cs`:
-
-```csharp
-using System.Collections.Concurrent;
-
-namespace NotificationService.Services;
-
-public class IdempotencyService
-{
-    private readonly ConcurrentDictionary<Guid, DateTime> _processed = new();
-
-    public bool AlreadyProcessed(Guid notificationId) =>
-        _processed.ContainsKey(notificationId);
-
-    public void Register(Guid notificationId) =>
-        _processed.TryAdd(notificationId, DateTime.UtcNow);
-
-    public void Cleanup()
-    {
-        var cutoff = DateTime.UtcNow.AddHours(-1);
-        foreach (var key in _processed.Keys)
-            if (_processed.TryGetValue(key, out var processedAt) && processedAt < cutoff)
-                _processed.TryRemove(key, out _);
-    }
-}
-```
-
-**O que é idempotência?**
-
-Uma operação é **idempotente** quando executá-la várias vezes produz o mesmo resultado que executá-la uma vez. Exemplo: enviar o mesmo e-mail duas vezes para o mesmo cliente é ruim. A idempotência evita isso.
-
-**Como funciona:**
-1. Quando processamos uma notificação com sucesso, registramos o `NotificationId` no dicionário.
-2. Se a mesma notificação chegar de novo (porque o RabbitMQ reenviou, por exemplo), verificamos se ela já foi processada.
-3. Se sim, descartamos sem processar novamente.
-
-**`ConcurrentDictionary`**: é uma versão do `Dictionary` que é **thread-safe** — múltiplos threads podem ler e escrever ao mesmo tempo sem problemas.
-
-**`Cleanup()`**: remove entradas com mais de 1 hora para evitar que o dicionário cresça infinitamente. É chamado a cada 30 segundos pelo Worker.
-
-> **Em produção**, você usaria **Redis** em vez de um dicionário em memória, para que a idempotência funcione mesmo com múltiplas instâncias do serviço.
-
-#### MetricsService
-
-Crie o arquivo `NotificationService/Services/MetricsService.cs`:
-
-```csharp
-using System.Collections.Concurrent;
-
-namespace NotificationService.Services;
-
-public class MetricsService
-{
-    private long _totalProcessed;
-    private long _totalFailed;
-    private long _totalDuplicates;
-    private long _totalSentToDlq;
-    private long _totalElapsedMs;
-    private long _successCount;
-
-    private readonly ConcurrentDictionary<string, long> _successByType = new();
-    private readonly ConcurrentDictionary<string, long> _failureByType = new();
-
-    public void RecordSuccess(string type, long elapsedMs)
-    {
-        Interlocked.Increment(ref _totalProcessed);
-        Interlocked.Add(ref _totalElapsedMs, elapsedMs);
-        Interlocked.Increment(ref _successCount);
-        _successByType.AddOrUpdate(type, 1, (_, v) => Interlocked.Increment(ref v));
-    }
-
-    public void RecordFailure(string type)
-    {
-        Interlocked.Increment(ref _totalFailed);
-        _failureByType.AddOrUpdate(type, 1, (_, v) => Interlocked.Increment(ref v));
-    }
-
-    public void RecordDuplicate() => Interlocked.Increment(ref _totalDuplicates);
-
-    public void RecordDlq() => Interlocked.Increment(ref _totalSentToDlq);
-
-    public void LogSummary(ILogger logger)
-    {
-        var avgMs = _successCount > 0 ? _totalElapsedMs / _successCount : 0;
-
-        var successByType = string.Join(" | ", _successByType
-            .Select(kv => $"{kv.Key}: {kv.Value}"));
-
-        var failureByType = string.Join(" | ", _failureByType
-            .Select(kv => $"{kv.Key}: {kv.Value}"));
-
-        logger.LogInformation(
-            "=== MÉTRICAS ===" +
-            " Processadas: {Processed}" +
-            " | Falhas: {Failed}" +
-            " | DLQ: {Dlq}" +
-            " | Duplicatas: {Dup}" +
-            " | Tempo médio: {Avg}ms" +
-            " | Sucesso por tipo: [{ByType}]" +
-            " | Falha por tipo: [{FailType}]",
-            _totalProcessed,
-            _totalFailed,
-            _totalSentToDlq,
-            _totalDuplicates,
-            avgMs,
-            successByType,
-            failureByType
-        );
-    }
-}
-```
-
-**Por que `Interlocked`?**
-
-Múltiplas notificações são processadas em paralelo (lembra do `prefetchCount: 5`?). Se dois threads tentarem incrementar `_totalProcessed` ao mesmo tempo, podemos perder uma contagem. `Interlocked.Increment` garante uma operação **atômica** — ou seja, o incremento é indivisível e thread-safe.
-
-### 6.9 Criar o Worker
-
-Substitua o conteúdo de `NotificationService/Worker.cs`:
+Substitua `NotificationService/Worker.cs`:
 
 ```csharp
 using NotificationService.Messaging;
-using NotificationService.Notifications;
-using NotificationService.Services;
 using RabbitMQ.Client;
 
 namespace NotificationService;
 
 public class Worker : BackgroundService
 {
-    private readonly IEnumerable<INotificationHandler> _handlers;
-    private readonly IdempotencyService _idempotency;
-    private readonly MetricsService _metrics;
     private readonly ILoggerFactory _loggerFactory;
     private readonly string _rabbitHost;
 
-    public Worker(
-        IEnumerable<INotificationHandler> handlers,
-        IdempotencyService idempotency,
-        MetricsService metrics,
-        ILoggerFactory loggerFactory,
-        IConfiguration config)
+    public Worker(ILoggerFactory loggerFactory, IConfiguration config)
     {
-        _handlers      = handlers;
-        _idempotency   = idempotency;
-        _metrics       = metrics;
         _loggerFactory = loggerFactory;
         _rabbitHost    = config["RabbitMQ:Host"] ?? "localhost";
     }
@@ -1823,10 +1002,6 @@ public class Worker : BackgroundService
             cancellationToken: stoppingToken);
         await using var orderPublishChannel = await connection.CreateChannelAsync(
             cancellationToken: stoppingToken);
-        await using var notifConsumeChannel = await connection.CreateChannelAsync(
-            cancellationToken: stoppingToken);
-        await using var notifPublishChannel = await connection.CreateChannelAsync(
-            cancellationToken: stoppingToken);
 
         await RabbitMqTopology.DeclareAsync(setupChannel);
         logger.LogInformation("Topologia RabbitMQ declarada com sucesso.");
@@ -1837,26 +1012,6 @@ public class Worker : BackgroundService
             _loggerFactory.CreateLogger<OrderConsumer>()
         );
         await orderConsumer.StartAsync(stoppingToken);
-
-        var notifConsumer = new NotificationConsumer(
-            notifConsumeChannel,
-            notifPublishChannel,
-            _handlers,
-            _idempotency,
-            _metrics,
-            _loggerFactory.CreateLogger<NotificationConsumer>()
-        );
-        await notifConsumer.StartAsync(stoppingToken);
-
-        _ = Task.Run(async () =>
-        {
-            using var timer = new PeriodicTimer(TimeSpan.FromSeconds(30));
-            while (await timer.WaitForNextTickAsync(stoppingToken))
-            {
-                _metrics.LogSummary(logger);
-                _idempotency.Cleanup();
-            }
-        }, stoppingToken);
 
         logger.LogInformation("NotificationService pronto. Aguardando mensagens...");
         await Task.Delay(Timeout.Infinite, stoppingToken);
@@ -1884,62 +1039,16 @@ public class Worker : BackgroundService
 }
 ```
 
-**O que é `BackgroundService`?**
+**O Worker ficou muito mais simples**: apenas 3 canais (setup, consumo, publicação) e um único consumer.
 
-É uma classe base do .NET para criar serviços que rodam em segundo plano. Você sobrescreve o método `ExecuteAsync` e ele fica rodando enquanto a aplicação estiver viva.
+### 7.6 Configurar o Program.cs
 
-**Entendendo o `ExecuteAsync`:**
-
-1. **`WaitForRabbitMqAsync`**: espera o RabbitMQ ficar disponível. No Docker, o RabbitMQ pode demorar alguns segundos para iniciar, então o Worker fica tentando conectar a cada 3 segundos.
-
-2. **5 canais separados**: cada operação (setup, consumo de orders, publicação de notificações, consumo de notificações, publicação de retries) usa seu próprio canal para evitar interferência.
-
-3. **`PeriodicTimer`**: a cada 30 segundos, loga um resumo de métricas e limpa entradas antigas do serviço de idempotência.
-
-4. **`Task.Delay(Timeout.Infinite, stoppingToken)`**: mantém o método rodando indefinidamente até receber o sinal de parada.
-
-> 🌍 **Além do tutorial — o ciclo de vida completo do `BackgroundService`**
->
-> O `BackgroundService` é uma abstração sobre `IHostedService`. Entender o ciclo de vida completo é essencial para evitar bugs de shutdown:
->
-> ```
-> Host.StartAsync()
->   └── IHostedService.StartAsync()
->         └── inicia Task: ExecuteAsync(stoppingToken)   ← você implementa isso
->
-> Host.StopAsync()  (Ctrl+C, SIGTERM, ou código)
->   └── stoppingToken.Cancel()                           ← sinaliza para parar
->   └── aguarda ExecuteAsync() terminar (com timeout)
->   └── IHostedService.StopAsync()
-> ```
->
-> **O `stoppingToken` é o contrato de encerramento gracioso.** Quando o host quer parar (Ctrl+C, deploy, SIGTERM do Kubernetes), ele cancela o token. Você deve verificar `stoppingToken.IsCancellationRequested` e sair do loop limpo. Sem isso, o host força o encerramento após um timeout (padrão: 5 segundos).
->
-> **O que acontece se `ExecuteAsync` lançar uma exceção não capturada?** O host registra o erro e para o processo inteiro. Por isso nosso `ExecuteAsync` tem o `WaitForRabbitMqAsync` num loop — se a conexão falhar, tentamos de novo em vez de morrer.
-
-> 🤔 **E se...?** — `CancellationToken` em toda a cadeia de chamadas
->
-> Note que o `stoppingToken` é passado para `WaitForRabbitMqAsync`, para `CreateConnectionAsync`, para `CreateChannelAsync`, para `BasicConsumeAsync`... Essa é a **propagação de CancellationToken** — um dos idioms mais importantes em código .NET assíncrono. Quando o token é cancelado, todas as operações pendentes na cadeia recebem o sinal e podem encerrar graciosamente. Se você "esquecer" de passar o token em um ponto da cadeia, aquela operação pode ficar pendurada mesmo depois do host tentar parar. A regra é: **sempre aceite e repasse o `CancellationToken`**.
-
-
-
-### 6.10 Configurar o Program.cs do NotificationService
-
-Substitua o conteúdo de `NotificationService/Program.cs`:
+Substitua `NotificationService/Program.cs`:
 
 ```csharp
 using NotificationService;
-using NotificationService.Notifications;
-using NotificationService.Services;
 
 var builder = Host.CreateApplicationBuilder(args);
-
-builder.Services.AddSingleton<INotificationHandler, EmailNotificationHandler>();
-builder.Services.AddSingleton<INotificationHandler, PushNotificationHandler>();
-builder.Services.AddSingleton<INotificationHandler, SmsNotificationHandler>();
-
-builder.Services.AddSingleton<IdempotencyService>();
-builder.Services.AddSingleton<MetricsService>();
 
 builder.Services.AddHostedService<Worker>();
 
@@ -1947,61 +1056,505 @@ var host = builder.Build();
 host.Run();
 ```
 
-**Registrando múltiplas implementações:**
+O Program.cs também ficou mínimo — sem handlers, sem serviços de suporte. Toda essa responsabilidade migrou para os serviços dedicados.
 
-```csharp
-builder.Services.AddSingleton<INotificationHandler, EmailNotificationHandler>();
-builder.Services.AddSingleton<INotificationHandler, PushNotificationHandler>();
-builder.Services.AddSingleton<INotificationHandler, SmsNotificationHandler>();
+---
+
+## 8. Etapa 5 — EmailService (Worker de E-mail)
+
+O EmailService é o primeiro dos três serviços dedicados de notificação. Ele:
+
+1. Declara sua **própria topologia** no RabbitMQ (fila, retry queues, DLQ).
+2. Consome da fila `notifications.email`.
+3. Processa com retry e DLQ.
+4. Garante idempotência.
+5. Coleta métricas.
+
+Os outros dois (PushService e SmsService) seguem exatamente a mesma estrutura, mudando apenas o nome, a routing key e a simulação de falha.
+
+### 8.1 Instalar pacotes e referências
+
+```powershell
+cd EmailService
+dotnet add package RabbitMQ.Client --version 7.2.1
+dotnet add package Microsoft.Extensions.Hosting --version 8.0.1
+dotnet add reference ../Contracts/Contracts.csproj
+cd ..
 ```
 
-O container de DI permite registrar **múltiplas implementações** para a mesma interface. Quando o Worker pede `IEnumerable<INotificationHandler>`, o DI injeta **todos os três** handlers. Essa é a base do padrão **Strategy**.
+### 8.2 Criar a estrutura de pastas
 
-**Por que tudo é Singleton aqui?**
+```powershell
+mkdir EmailService/Messaging
+mkdir EmailService/Services
+```
 
-Cada serviço tem uma razão diferente para ser Singleton:
+### 8.3 Topologia do EmailService — RabbitMqTopology
 
-| Serviço | Por que Singleton? |
-|---|---|
-| `IRabbitMqPublisher` | Conexão TCP com RabbitMQ é cara de criar. Uma por app é o padrão recomendado. |
-| `EmailHandler`, `PushHandler`, `SmsHandler` | São **stateless** — não guardam nenhum estado mutável. Poderiam ser `Transient`, mas Singleton evita re-instanciação desnecessária. |
-| `IdempotencyService` | **Obrigatório.** Guarda um `ConcurrentDictionary` em memória. Se fosse `Transient`, cada instância teria seu próprio dicionário vazio — a idempotência não funcionaria. |
-| `MetricsService` | **Obrigatório.** Tem contadores com `Interlocked`. Se fosse `Transient`, cada instância zeraria os contadores — as métricas seriam sempre 0. |
+Crie `EmailService/Messaging/RabbitMqTopology.cs`:
 
-**Regra geral para escolher o lifetime:**
-- Tem **estado compartilhado** (dicionário, contadores)? → **precisa** ser Singleton
-- Tem **recurso caro** (conexão de rede, pool)? → **deve** ser Singleton
-- É **stateless** (só processa e retorna)? → pode ser qualquer um; Singleton é uma escolha razoável
+```csharp
+using RabbitMQ.Client;
 
-> **Cuidado:** nunca injete um serviço `Scoped` dentro de um `Singleton`. O container de DI do .NET lança uma exceção em tempo de execução se isso acontecer. Neste projeto não temos esse problema, mas vale saber.
+namespace EmailService.Messaging;
 
-> 🌍 **Além do tutorial — o ecossistema de containers de DI no .NET**
->
-> O `Microsoft.Extensions.DependencyInjection` que usamos é simples, rápido e suficiente para a maioria dos projetos. Mas existem alternativas para casos mais complexos:
->
-> | Container | Quando considerar |
-> |---|---|
-> | **Microsoft.Extensions.DI** (padrão) | 99% dos projetos. Suporta Singleton/Scoped/Transient, múltiplas implementações, factories. |
-> | **Autofac** | Quando você precisa de *property injection*, *decorator pattern* automático, ou módulos de registro. Muito usado em projetos legados e enterprise. |
-> | **Scrutor** | Extensão sobre o Microsoft DI que adiciona *assembly scanning* — registra automaticamente todas as classes que implementam uma interface. Útil quando você tem muitos handlers/repositórios. |
-> | **Castle Windsor** | Interceptors AOP (para logging, caching automático). Muito poderoso, mas complexo. |
->
-> Para o nosso sistema, note que poderíamos usar **Scrutor** para registrar os handlers de notificação automaticamente — em vez de registrar `EmailHandler`, `PushHandler`, `SmsHandler` manualmente, ele faria um scan do assembly e registraria qualquer classe que implementa `INotificationHandler`. Menos código manual, mais fácil de adicionar novos handlers.
+public static class RabbitMqTopology
+{
+    public const string NotificationsExchange = "notifications.exchange";
+    public const string RetryExchange         = "notifications.email.retry.exchange";
+    public const string ServiceQueue          = "notifications.email";
+    public const string DlqQueue             = "notifications.email.dlq";
+    public const string RoutingKey           = "email";
 
+    public static readonly int[] RetryDelaysMs = [5_000, 15_000, 45_000];
 
+    public static async Task DeclareAsync(IChannel channel)
+    {
+        await channel.ExchangeDeclareAsync(
+            exchange: NotificationsExchange,
+            type: ExchangeType.Direct,
+            durable: true
+        );
 
-> 🧩 **Desafio — raciocínio sobre lifetimes**
->
-> Considere este cenário hipotético: você quer adicionar um `AuditService` que salva no banco de dados toda vez que uma notificação é processada. Você usa Entity Framework Core, que recomenda registrar o `DbContext` como `Scoped`. Mas o `NotificationConsumer` é injetado num `Singleton` (o Worker). O que acontece? Como você resolveria isso? (Pesquise sobre `IServiceScopeFactory` e o padrão de criar um scope manualmente dentro de Singletons.)
+        await channel.ExchangeDeclareAsync(
+            exchange: RetryExchange,
+            type: ExchangeType.Direct,
+            durable: true
+        );
 
+        await channel.QueueDeclareAsync(
+            queue: ServiceQueue,
+            durable: true,
+            exclusive: false,
+            autoDelete: false
+        );
+        await channel.QueueBindAsync(
+            queue: ServiceQueue,
+            exchange: NotificationsExchange,
+            routingKey: RoutingKey
+        );
 
+        for (int i = 0; i < RetryDelaysMs.Length; i++)
+        {
+            var retryQueue = $"notifications.email.retry.{i + 1}";
+            await channel.QueueDeclareAsync(
+                queue: retryQueue,
+                durable: true,
+                exclusive: false,
+                autoDelete: false,
+                arguments: new Dictionary<string, object?>
+                {
+                    ["x-message-ttl"]             = RetryDelaysMs[i],
+                    ["x-dead-letter-exchange"]    = NotificationsExchange,
+                    ["x-dead-letter-routing-key"] = RoutingKey
+                }
+            );
+            await channel.QueueBindAsync(
+                queue: retryQueue,
+                exchange: RetryExchange,
+                routingKey: $"retry.{i + 1}"
+            );
+        }
 
-### 6.11 Configurar o appsettings.json
+        await channel.QueueDeclareAsync(
+            queue: DlqQueue,
+            durable: true,
+            exclusive: false,
+            autoDelete: false
+        );
+    }
+}
+```
 
-O arquivo `NotificationService/appsettings.json`:
+**Cada serviço tem sua PRÓPRIA topologia isolada.** Compare:
+
+| Recurso | EmailService | PushService | SmsService |
+|---------|-------------|-------------|------------|
+| Fila principal | `notifications.email` | `notifications.push` | `notifications.sms` |
+| Exchange de retry | `notifications.email.retry.exchange` | `notifications.push.retry.exchange` | `notifications.sms.retry.exchange` |
+| Filas de retry | `notifications.email.retry.1/2/3` | `notifications.push.retry.1/2/3` | `notifications.sms.retry.1/2/3` |
+| DLQ | `notifications.email.dlq` | `notifications.push.dlq` | `notifications.sms.dlq` |
+| Routing key | `"email"` | `"push"` | `"sms"` |
+
+Todos compartilham a mesma `notifications.exchange` — ela é declarada idempotentemente por cada serviço.
+
+**Detalhe crítico — `x-dead-letter-routing-key`:**
+
+```csharp
+["x-dead-letter-routing-key"] = RoutingKey   // "email" — crítico!
+```
+
+Quando uma mensagem expira na fila de retry (TTL vence), o RabbitMQ a move para a exchange configurada em `x-dead-letter-exchange` com a routing key de `x-dead-letter-routing-key`. Se essa routing key fosse errada (ex: `"notification"` em vez de `"email"`), a mensagem **desapareceria silenciosamente** — nenhuma fila teria binding para ela.
+
+#### Diagrama da topologia do EmailService
+
+```text
+              ┌─────────────────────────────┐
+              │     notifications.exchange   │  (compartilhada por todos)
+              │         (DIRECT)             │
+              └───────────┬─────────────────┘
+                          │ routing key: "email"
+                          ▼
+              ┌─────────────────────────────┐
+              │  notifications.email (fila) │◄──── mensagens novas
+              │                             │◄──── mensagens que voltaram do retry
+              └───────────┬─────────────────┘
+                          │ consumer lê
+                          ▼
+                   ┌──────────────┐
+                   │   Sucesso?   │
+                   └──────┬───────┘
+                     Sim  │   Não
+                     │    │
+                     ▼    ▼
+                   [OK] ┌─────────────────┐
+                        │ RetryCount ≤ 3? │
+                        └───────┬─────────┘
+                          Sim   │   Não
+                          │     │
+                          ▼     ▼
+  ┌─────────────────────────────┐  ┌──────────────────────────┐
+  │ notifications.email.retry.  │  │  notifications.email.dlq │
+  │ exchange (DIRECT)           │  │  (fila final)            │
+  └───────────┬─────────────────┘  └──────────────────────────┘
+              │ routing key:
+              │ "retry.1" / "retry.2" / "retry.3"
+              ▼
+  ┌──────────────────────────────────┐
+  │ notifications.email.retry.1      │ ← TTL 5s
+  │ notifications.email.retry.2      │ ← TTL 15s
+  │ notifications.email.retry.3      │ ← TTL 45s
+  └──────────┬───────────────────────┘
+             │ quando o TTL expira, x-dead-letter-exchange
+             │ = notifications.exchange, routing key = "email"
+             ▼
+  ┌─────────────────────────────┐
+  │  notifications.email (fila) │  ← volta para a fila principal!
+  └─────────────────────────────┘
+```
+
+### 8.4 NotificationConsumer do EmailService
+
+Crie `EmailService/Messaging/NotificationConsumer.cs`:
+
+```csharp
+using System.Text;
+using System.Text.Json;
+using Contracts;
+using EmailService.Services;
+using RabbitMQ.Client;
+using RabbitMQ.Client.Events;
+
+namespace EmailService.Messaging;
+
+public class NotificationConsumer
+{
+    private readonly IChannel _consumeChannel;
+    private readonly IChannel _publishChannel;
+    private readonly IdempotencyService _idempotency;
+    private readonly MetricsService _metrics;
+    private readonly ILogger _logger;
+    private readonly SemaphoreSlim _publishLock = new(1, 1);
+
+    public NotificationConsumer(
+        IChannel consumeChannel,
+        IChannel publishChannel,
+        IdempotencyService idempotency,
+        MetricsService metrics,
+        ILogger logger)
+    {
+        _consumeChannel = consumeChannel;
+        _publishChannel = publishChannel;
+        _idempotency    = idempotency;
+        _metrics        = metrics;
+        _logger         = logger;
+    }
+
+    public async Task StartAsync(CancellationToken ct)
+    {
+        await _consumeChannel.BasicQosAsync(
+            prefetchSize: 0, prefetchCount: 1, global: false, cancellationToken: ct
+        );
+
+        var consumer = new AsyncEventingBasicConsumer(_consumeChannel);
+        consumer.ReceivedAsync += HandleNotificationAsync;
+
+        await _consumeChannel.BasicConsumeAsync(
+            queue: RabbitMqTopology.ServiceQueue,
+            autoAck: false,
+            consumer: consumer,
+            cancellationToken: ct
+        );
+
+        _logger.LogInformation("[EmailService] Aguardando notificações...");
+    }
+
+    private async Task HandleNotificationAsync(object _, BasicDeliverEventArgs args)
+    {
+        var json = Encoding.UTF8.GetString(args.Body.ToArray());
+        var notification = JsonSerializer.Deserialize<NotificationMessage>(json)!;
+
+        if (!_idempotency.TryMarkProcessed(notification.NotificationId))
+        {
+            _logger.LogWarning("[EmailService] Duplicata ignorada: {Id}", notification.NotificationId);
+            await _consumeChannel.BasicAckAsync(args.DeliveryTag, multiple: false);
+            return;
+        }
+
+        var success = await SimulateEmailAsync(notification);
+
+        if (success)
+        {
+            _metrics.RecordSuccess("email");
+            _logger.LogInformation(
+                "[EmailService] Enviado para {Recipient} (pedido {OrderId})",
+                notification.Recipient, notification.OrderId
+            );
+            await _consumeChannel.BasicAckAsync(args.DeliveryTag, multiple: false);
+            return;
+        }
+
+        var nextRetry = notification.RetryCount + 1;
+
+        if (nextRetry <= RabbitMqTopology.RetryDelaysMs.Length)
+        {
+            _logger.LogWarning("[EmailService] [RETRY {Retry}/3] {Id}", nextRetry, notification.NotificationId);
+            _metrics.RecordFailure();
+
+            var retryMsg = notification with { RetryCount = nextRetry };
+            var body     = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(retryMsg));
+            var props    = new BasicProperties { Persistent = true };
+
+            await _publishLock.WaitAsync();
+            try
+            {
+                await _publishChannel.BasicPublishAsync(
+                    exchange: RabbitMqTopology.RetryExchange,
+                    routingKey: $"retry.{nextRetry}",
+                    mandatory: false,
+                    basicProperties: props,
+                    body: body
+                );
+            }
+            finally { _publishLock.Release(); }
+        }
+        else
+        {
+            _logger.LogError("[EmailService] [DLQ] Esgotadas tentativas: {Id}", notification.NotificationId);
+            _metrics.RecordDlq();
+
+            var body  = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(notification));
+            var props = new BasicProperties { Persistent = true };
+
+            await _publishLock.WaitAsync();
+            try
+            {
+                await _publishChannel.BasicPublishAsync(
+                    exchange: "",
+                    routingKey: RabbitMqTopology.DlqQueue,
+                    mandatory: false,
+                    basicProperties: props,
+                    body: body
+                );
+            }
+            finally { _publishLock.Release(); }
+        }
+
+        await _consumeChannel.BasicAckAsync(args.DeliveryTag, multiple: false);
+    }
+
+    private static async Task<bool> SimulateEmailAsync(NotificationMessage notification)
+    {
+        await Task.Delay(Random.Shared.Next(50, 150));
+        return Random.Shared.NextDouble() >= 0.30;
+    }
+}
+```
+
+**Diferença em relação à versão anterior:** a simulação agora está **embutida no consumer** (`SimulateEmailAsync`) em vez de em handlers separados. Faz sentido porque cada serviço lida com exatamente um tipo de notificação — não há necessidade do padrão Strategy aqui.
+
+**O SemaphoreSlim** garante que apenas uma publicação aconteça por vez no canal de publicação, já que `BasicPublishAsync` não é thread-safe.
+
+### 8.5 Serviços de suporte
+
+#### IdempotencyService
+
+Crie `EmailService/Services/IdempotencyService.cs`:
+
+```csharp
+using System.Collections.Concurrent;
+
+namespace EmailService.Services;
+
+public class IdempotencyService
+{
+    private readonly ConcurrentDictionary<Guid, byte> _processed = new();
+
+    public bool TryMarkProcessed(Guid notificationId) =>
+        _processed.TryAdd(notificationId, 0);
+
+    public void Cleanup() => _processed.Clear();
+}
+```
+
+**Simplificação:** em vez de `AlreadyProcessed` + `Register` em dois métodos, agora é um único `TryMarkProcessed` que retorna `true` se é novo (adicionou com sucesso) e `false` se é duplicata (já existia). Mais conciso e atômico.
+
+#### MetricsService
+
+Crie `EmailService/Services/MetricsService.cs`:
+
+```csharp
+using System.Collections.Concurrent;
+
+namespace EmailService.Services;
+
+public class MetricsService
+{
+    private long _totalProcessed;
+    private long _totalFailed;
+    private long _totalDlq;
+    private readonly ConcurrentDictionary<string, long> _successByType = new();
+
+    public void RecordSuccess(string type)
+    {
+        Interlocked.Increment(ref _totalProcessed);
+        _successByType.AddOrUpdate(type, 1, (_, v) => Interlocked.Increment(ref v));
+    }
+
+    public void RecordFailure() => Interlocked.Increment(ref _totalFailed);
+    public void RecordDlq()     => Interlocked.Increment(ref _totalDlq);
+
+    public void LogSummary(ILogger logger)
+    {
+        logger.LogInformation(
+            "[Métricas] Processadas: {Processed} | Falhas: {Failed} | DLQ: {Dlq}",
+            _totalProcessed, _totalFailed, _totalDlq
+        );
+    }
+}
+```
+
+### 8.6 Worker do EmailService
+
+Crie `EmailService/Worker.cs`:
+
+```csharp
+using EmailService.Messaging;
+using EmailService.Services;
+using RabbitMQ.Client;
+
+namespace EmailService;
+
+public class Worker : BackgroundService
+{
+    private readonly IdempotencyService _idempotency;
+    private readonly MetricsService _metrics;
+    private readonly ILoggerFactory _loggerFactory;
+    private readonly string _rabbitHost;
+
+    public Worker(
+        IdempotencyService idempotency,
+        MetricsService metrics,
+        ILoggerFactory loggerFactory,
+        IConfiguration config)
+    {
+        _idempotency   = idempotency;
+        _metrics       = metrics;
+        _loggerFactory = loggerFactory;
+        _rabbitHost    = config["RabbitMQ:Host"] ?? "localhost";
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        var logger = _loggerFactory.CreateLogger<Worker>();
+
+        await WaitForRabbitMqAsync(logger, stoppingToken);
+
+        var factory = new ConnectionFactory { HostName = _rabbitHost };
+        await using var connection = await factory.CreateConnectionAsync(stoppingToken);
+
+        await using var setupChannel   = await connection.CreateChannelAsync(
+            cancellationToken: stoppingToken);
+        await using var consumeChannel = await connection.CreateChannelAsync(
+            cancellationToken: stoppingToken);
+        await using var publishChannel = await connection.CreateChannelAsync(
+            cancellationToken: stoppingToken);
+
+        await RabbitMqTopology.DeclareAsync(setupChannel);
+        logger.LogInformation("[EmailService] Topologia declarada.");
+
+        var consumer = new NotificationConsumer(
+            consumeChannel,
+            publishChannel,
+            _idempotency,
+            _metrics,
+            _loggerFactory.CreateLogger<NotificationConsumer>()
+        );
+        await consumer.StartAsync(stoppingToken);
+
+        _ = Task.Run(async () =>
+        {
+            using var timer = new PeriodicTimer(TimeSpan.FromSeconds(30));
+            while (await timer.WaitForNextTickAsync(stoppingToken))
+            {
+                _metrics.LogSummary(logger);
+                _idempotency.Cleanup();
+            }
+        }, stoppingToken);
+
+        logger.LogInformation("[EmailService] Pronto. Aguardando notificações de email...");
+        await Task.Delay(Timeout.Infinite, stoppingToken);
+    }
+
+    private async Task WaitForRabbitMqAsync(ILogger logger, CancellationToken ct)
+    {
+        var factory = new ConnectionFactory { HostName = _rabbitHost };
+
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                await using var connection = await factory.CreateConnectionAsync(ct);
+                logger.LogInformation("[EmailService] Conectado ao RabbitMQ!");
+                return;
+            }
+            catch
+            {
+                logger.LogWarning("[EmailService] RabbitMQ não está pronto. Tentando novamente em 3s...");
+                await Task.Delay(3_000, ct);
+            }
+        }
+    }
+}
+```
+
+### 8.7 Program.cs do EmailService
+
+Substitua `EmailService/Program.cs`:
+
+```csharp
+using EmailService;
+using EmailService.Services;
+
+var builder = Host.CreateApplicationBuilder(args);
+
+builder.Services.AddSingleton<IdempotencyService>();
+builder.Services.AddSingleton<MetricsService>();
+builder.Services.AddHostedService<Worker>();
+
+var host = builder.Build();
+host.Run();
+```
+
+### 8.8 appsettings.json do EmailService
+
+`EmailService/appsettings.json`:
 
 ```json
 {
+  "RabbitMQ": {
+    "Host": "localhost"
+  },
   "Logging": {
     "LogLevel": {
       "Default": "Information",
@@ -2013,94 +1566,149 @@ O arquivo `NotificationService/appsettings.json`:
 
 ---
 
-## 7. Etapa 4 — Docker e Docker Compose
+## 9. Etapa 6 — PushService e SmsService
 
-### 7.1 Dockerfile do OrderService
+O PushService e o SmsService seguem **exatamente a mesma estrutura** do EmailService. As únicas diferenças são:
 
-Crie o arquivo `OrderService/Dockerfile`:
+| Aspecto | EmailService | PushService | SmsService |
+|---------|-------------|-------------|------------|
+| Namespace | `EmailService.*` | `PushService.*` | `SmsService.*` |
+| Routing key | `"email"` | `"push"` | `"sms"` |
+| Fila principal | `notifications.email` | `notifications.push` | `notifications.sms` |
+| DLQ | `notifications.email.dlq` | `notifications.push.dlq` | `notifications.sms.dlq` |
+| Exchange de retry | `notifications.email.retry.exchange` | `notifications.push.retry.exchange` | `notifications.sms.retry.exchange` |
+| Taxa de falha simulada | 30% (SMTP instável) | 20% (token expirado) | 40% (operadora instável) |
+| Latência simulada | 50-150ms | 20-80ms | 100-300ms |
+
+### 9.1 Criar o PushService
+
+Repita os mesmos passos do EmailService, substituindo:
+- Namespace: `EmailService` → `PushService`
+- Routing key e nomes de filas: `email` → `push`
+- Simulação de falha: `SimulatePushAsync` com 20% de falha e 20-80ms de latência
+
+```powershell
+cd PushService
+dotnet add package RabbitMQ.Client --version 7.2.1
+dotnet add package Microsoft.Extensions.Hosting --version 8.0.1
+dotnet add reference ../Contracts/Contracts.csproj
+cd ..
+```
+
+No `NotificationConsumer` do PushService, a simulação muda para:
+
+```csharp
+private static async Task<bool> SimulatePushAsync(NotificationMessage notification)
+{
+    await Task.Delay(Random.Shared.Next(20, 80));
+    return Random.Shared.NextDouble() >= 0.20;
+}
+```
+
+### 9.2 Criar o SmsService
+
+Mesma coisa, substituindo `email` → `sms` e com 40% de falha e 100-300ms de latência:
+
+```powershell
+cd SmsService
+dotnet add package RabbitMQ.Client --version 7.2.1
+dotnet add package Microsoft.Extensions.Hosting --version 8.0.1
+dotnet add reference ../Contracts/Contracts.csproj
+cd ..
+```
+
+No `NotificationConsumer` do SmsService:
+
+```csharp
+private static async Task<bool> SimulateSmsAsync(NotificationMessage notification)
+{
+    await Task.Delay(Random.Shared.Next(100, 300));
+    return Random.Shared.NextDouble() >= 0.40;
+}
+```
+
+O SMS tem a maior taxa de falha (40%) porque, na vida real, operadoras de telecomunicações são historicamente o canal menos confiável.
+
+---
+
+## 10. Etapa 7 — Docker e Docker Compose
+
+### 10.1 Dockerfiles — Build Multi-Projeto
+
+Como todos os serviços referenciam o projeto `Contracts`, os Dockerfiles precisam do **contexto da raiz** para acessar ambos os projetos durante o build.
+
+#### Dockerfile do OrderService
+
+Crie `OrderService/Dockerfile`:
 
 ```dockerfile
-# Estágio 1: build
 FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
 WORKDIR /app
+COPY Contracts/Contracts.csproj Contracts/
+COPY OrderService/OrderService.csproj OrderService/
+RUN dotnet restore OrderService/OrderService.csproj
+COPY Contracts/ Contracts/
+COPY EmailService/ EmailService/
+RUN dotnet publish OrderService/OrderService.csproj -c Release -o /out
 
-COPY *.csproj .
-RUN dotnet restore
-
-COPY . .
-RUN dotnet publish -c Release -o /out
-
-# Estágio 2: runtime
 FROM mcr.microsoft.com/dotnet/aspnet:8.0
 WORKDIR /app
 COPY --from=build /out .
-
 ENTRYPOINT ["dotnet", "OrderService.dll"]
 ```
 
-**O que é um Dockerfile multi-stage?**
+**Diferença em relação ao Dockerfile anterior:** agora copiamos `Contracts/` antes do serviço, porque o `OrderService.csproj` tem um `ProjectReference` para `Contracts.csproj`. O Docker precisa de ambos para compilar.
 
-O Dockerfile tem **dois estágios**:
+**Ordem das instruções COPY (otimização de cache):**
 
-**Estágio 1 (build):** usa a imagem `sdk:8.0` (~700 MB), que tem todas as ferramentas de compilação. Copia o código, restaura pacotes e compila.
+1. Primeiro copiamos só os `.csproj` e fazemos `restore` — isso cacheia os pacotes NuGet.
+2. Depois copiamos o código fonte e compilamos — se só o código mudar, o restore não é refeito.
 
-**Estágio 2 (runtime):** usa a imagem `aspnet:8.0` (~200 MB), que é muito menor e tem apenas o necessário para **executar** o aplicativo. Copia apenas os arquivos compilados do estágio anterior.
+#### Dockerfile do NotificationService
 
-**Por que dois estágios?** A imagem final fica muito menor (não inclui o SDK de compilação), o que significa downloads mais rápidos e containers mais leves.
-
-**Entendendo cada instrução:**
-
-| Instrução | O que faz |
-|-----------|-----------|
-| `FROM ... AS build` | Define a imagem base e dá um nome ao estágio |
-| `WORKDIR /app` | Define o diretório de trabalho dentro do container |
-| `COPY *.csproj .` | Copia só o .csproj primeiro (para cachear o restore) |
-| `RUN dotnet restore` | Baixa os pacotes NuGet |
-| `COPY . .` | Copia todo o código fonte |
-| `RUN dotnet publish -c Release -o /out` | Compila em modo Release e coloca o resultado em /out |
-| `COPY --from=build /out .` | Copia os arquivos compilados do estágio "build" |
-| `ENTRYPOINT [...]` | Comando que roda quando o container inicia |
-
-**Dica de performance:** copiamos o `.csproj` e fazemos `restore` ANTES de copiar o resto do código. Assim, o Docker cacheia a camada do restore. Se só o código mudar (sem alterar dependências), o restore não precisa ser refeito.
-
-> 💭 **Pare e pense — camadas Docker como unidade de cache**
->
-> O sistema de camadas do Docker é um dos conceitos mais importantes para builds rápidos em CI/CD. Cada instrução `RUN`, `COPY`, `ADD` cria uma nova camada — e o Docker reutiliza camadas que não mudaram. Por isso a ordem importa: coloque o que muda menos frequentemente primeiro. Agora olhe o seu Dockerfile: o que acontece se você alterar apenas um comentário no código? E se você alterar o `TotalAmount` de `decimal` para `long`? Quais camadas são invalidadas em cada caso?
-
-> 🌍 **Além do tutorial — imagens menores em produção**
->
-> A imagem `aspnet:8.0` que usamos já é bem menor que a `sdk:8.0`. Para sistemas críticos em produção, muitas equipes vão além: usam `mcr.microsoft.com/dotnet/runtime-deps:8.0-alpine` com **self-contained publish** + **trimming**, chegando a imagens de ~20-30 MB. Isso significa pulls mais rápidos, superfície de ataque menor e inicialização mais rápida. Vale explorar quando o projeto crescer.
-
-
-
-### 7.2 Dockerfile do NotificationService
-
-Crie o arquivo `NotificationService/Dockerfile`:
+Crie `NotificationService/Dockerfile`:
 
 ```dockerfile
-# Estágio 1: build
 FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
 WORKDIR /app
+COPY Contracts/Contracts.csproj Contracts/
+COPY NotificationService/NotificationService.csproj NotificationService/
+RUN dotnet restore NotificationService/NotificationService.csproj
+COPY Contracts/ Contracts/
+COPY NotificationService/ NotificationService/
+RUN dotnet publish NotificationService/NotificationService.csproj -c Release -o /out
 
-COPY *.csproj .
-RUN dotnet restore
-
-COPY . .
-RUN dotnet publish -c Release -o /out
-
-# Estágio 2: runtime
 FROM mcr.microsoft.com/dotnet/aspnet:8.0
 WORKDIR /app
 COPY --from=build /out .
-
 ENTRYPOINT ["dotnet", "NotificationService.dll"]
 ```
 
-É praticamente idêntico ao do OrderService — a única diferença é o nome da DLL no `ENTRYPOINT`.
+#### Dockerfile do EmailService (PushService e SmsService são idênticos, mudando o nome)
 
-### 7.3 Docker Compose — Orquestrando tudo
+Crie `EmailService/Dockerfile`:
 
-Crie o arquivo `docker-compose.yml` na **raiz** do projeto:
+```dockerfile
+FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+WORKDIR /app
+COPY Contracts/Contracts.csproj Contracts/
+COPY EmailService/EmailService.csproj EmailService/
+RUN dotnet restore EmailService/EmailService.csproj
+COPY Contracts/ Contracts/
+COPY EmailService/ EmailService/
+RUN dotnet publish EmailService/EmailService.csproj -c Release -o /out
+
+FROM mcr.microsoft.com/dotnet/aspnet:8.0
+WORKDIR /app
+COPY --from=build /out .
+ENTRYPOINT ["dotnet", "EmailService.dll"]
+```
+
+Repita para `PushService/Dockerfile` e `SmsService/Dockerfile`, trocando `EmailService` pelo nome correspondente.
+
+### 10.2 Docker Compose — Orquestrando 6 Serviços
+
+Crie `docker-compose.yml` na raiz do projeto:
 
 ```yaml
 version: '3.8'
@@ -2115,8 +1723,6 @@ services:
     environment:
       RABBITMQ_DEFAULT_USER: guest
       RABBITMQ_DEFAULT_PASS: guest
-    # Healthcheck garante que os serviços só iniciam quando o RabbitMQ estiver
-    # realmente pronto — depends_on sem condition não garante isso.
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 10s
@@ -2177,78 +1783,36 @@ services:
       - RabbitMQ__Host=rabbitmq
 ```
 
-**O que é Docker Compose?**
+**Novidades importantes:**
 
-Docker Compose permite definir e rodar **múltiplos containers** com um único comando. Em vez de rodar `docker run` para cada serviço, escrevemos um arquivo YAML que descreve tudo e rodamos `docker compose up`.
-
-> **Por que `build: context: .` em vez de `build: ./OrderService`?**
->
-> Os serviços têm um `ProjectReference` para o projeto `Contracts`. O Docker constrói a imagem usando apenas os arquivos dentro do build context. Se o context for `./OrderService`, o Docker não enxerga `../Contracts` — a build falha. Usar a raiz do repo como context resolve isso. O `dockerfile` explícito diz qual Dockerfile usar dentro desse context.
-
-**Entendendo cada serviço:**
-
-#### rabbitmq
+#### Healthcheck no RabbitMQ
 
 ```yaml
-rabbitmq:
-    image: rabbitmq:3-management
-    ports:
-      - "5672:5672"
-      - "15672:15672"
+healthcheck:
+  test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+  interval: 10s
+  timeout: 5s
+  retries: 5
+  start_period: 30s
 ```
 
-- `image: rabbitmq:3-management`: usa a imagem oficial do RabbitMQ com o painel web de administração.
-- `5672:5672`: porta AMQP — é por aqui que os serviços .NET se conectam.
-- `15672:15672`: porta do painel web — acesse http://localhost:15672 para ver filas, mensagens, etc.
+Antes, usávamos apenas `depends_on: rabbitmq`, que só garante que o **container** do RabbitMQ iniciou — mas não que ele está **pronto para aceitar conexões**. Agora, o Docker verifica a saúde do RabbitMQ com o comando `rabbitmq-diagnostics ping` a cada 10 segundos. Os outros serviços só iniciam quando o RabbitMQ responde `service_healthy`.
 
-#### order-service
+#### Build context na raiz
 
 ```yaml
-order-service:
-    build: ./OrderService
-    depends_on:
-      - rabbitmq
-    ports:
-      - "5000:8080"
-    environment:
-      - RabbitMQ__Host=rabbitmq
+build:
+  context: .
+  dockerfile: OrderService/Dockerfile
 ```
 
-- `build: { context: ., dockerfile: OrderService/Dockerfile }`: constrói a imagem usando a raiz do repo como contexto (necessário porque `OrderService` referencia o projeto `Contracts`).
-- `depends_on: rabbitmq: condition: service_healthy`: aguarda o healthcheck do RabbitMQ passar antes de subir o serviço. Combinado com o `WaitForRabbitMqAsync` no código, garante que a conexão AMQP esteja disponível.
-
-> 💭 **Pare e pense — "started" vs. "ready"**
->
-> `depends_on` sem `condition` garante apenas ordem de *início*, não de *prontidão*. Um container pode estar "started" mas ainda inicializando internamente. Esse problema clássico tem um nome: *startup race condition*. A combinação `healthcheck` + `condition: service_healthy` resolve no nível do Compose. O `WaitForRabbitMqAsync` no código é uma camada extra de defesa — importante quando o serviço é reiniciado isoladamente sem passar pelo Compose. Quais outros cenários teriam esse problema? Pense em banco de dados + migrations.
-
-
-- `"5000:8080"`: o ASP.NET roda na porta 8080 dentro do container. Mapeamos para 5000 no host. Então você acessa `http://localhost:5000`.
-- `RabbitMQ__Host=rabbitmq`: variável de ambiente que diz ao serviço para conectar no host `rabbitmq` (que é o nome do serviço Docker — Docker Compose cria uma rede interna onde os serviços se encontram pelo nome).
-
-> **Detalhe importante:** no Docker Compose, os serviços se comunicam pelo **nome do serviço** (como DNS). Então `rabbitmq` resolve para o IP interno do container do RabbitMQ. Mágico, não?
-
-> **Por que dois underscores (`__`)?** O ASP.NET mapeia variáveis de ambiente com `__` para `:` na configuração. Então `RabbitMQ__Host` vira `RabbitMQ:Host`, que é lido por `builder.Configuration["RabbitMQ:Host"]`.
-
-#### notification-service
-
-```yaml
-notification-service:
-    build: ./NotificationService
-    depends_on:
-      - rabbitmq
-    environment:
-      - RabbitMQ__Host=rabbitmq
-```
-
-Mesma lógica, mas sem `ports` — o NotificationService não expõe HTTP (ele é um Worker, não uma API).
+O `context: .` define que o build Docker roda a partir da **raiz do projeto** (não do subdiretório do serviço). Isso é necessário porque os Dockerfiles precisam copiar o projeto `Contracts/` que está fora do diretório do serviço.
 
 ---
 
-## 8. Etapa 5 — Testes Unitários
+## 11. Etapa 8 — Testes Unitários
 
-Testes são essenciais. Vamos criar testes para o `OrdersController`.
-
-### 8.1 Instalar os pacotes
+### 11.1 Instalar pacotes
 
 ```powershell
 cd OrderService.Tests
@@ -2257,126 +1821,76 @@ dotnet add reference ../OrderService/OrderService.csproj
 cd ..
 ```
 
-**Pacotes:**
-- `Moq`: biblioteca de mocking — permite criar "falsificações" de interfaces para testes.
-- A referência ao `OrderService.csproj` permite acessar as classes do OrderService nos testes.
-
-### 8.2 Verificar o .csproj dos testes
-
-O arquivo `OrderService.Tests/OrderService.Tests.csproj` deve ficar assim:
-
-```xml
-<Project Sdk="Microsoft.NET.Sdk">
-
-  <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
-    <IsPackable>false</IsPackable>
-    <IsTestProject>true</IsTestProject>
-  </PropertyGroup>
-
-  <ItemGroup>
-    <PackageReference Include="coverlet.collector" Version="6.0.0" />
-    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.8.0" />
-    <PackageReference Include="Moq" Version="4.20.72" />
-    <PackageReference Include="xunit" Version="2.5.3" />
-    <PackageReference Include="xunit.runner.visualstudio" Version="2.5.3" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <Using Include="Xunit" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <ProjectReference Include="..\OrderService\OrderService.csproj" />
-  </ItemGroup>
-
-</Project>
-```
-
-### 8.3 Criar os testes
+### 11.2 Testes do Controller
 
 Crie a pasta e o arquivo `OrderService.Tests/Controllers/OrdersControllerTests.cs`:
 
-```powershell
-mkdir OrderService.Tests/Controllers
-```
-
 ```csharp
+using Contracts;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging.Abstractions;
-using Moq;
 using OrderService.Controllers;
-using OrderService.Messaging;
-using OrderService.Models;
+using OrderService.Outbox;
 
 namespace OrderService.Tests.Controllers;
 
 public class OrdersControllerTests
 {
-    private readonly Mock<IRabbitMqPublisher> _publisherMock = new();
+    private readonly OutboxStore _outbox = new();
     private readonly OrdersController _controller;
 
     public OrdersControllerTests()
     {
         _controller = new OrdersController(
-            _publisherMock.Object,
+            _outbox,
             NullLogger<OrdersController>.Instance
         );
     }
 
     [Fact]
-    public async Task CreateOrder_DeveRetornar202_QuandoRequestValido()
+    public void CreateOrder_DeveRetornar202_QuandoRequestValido()
     {
         var request = new CreateOrderRequest("João Silva", 150.90m);
 
-        var result = await _controller.CreateOrder(request);
+        var result = _controller.CreateOrder(request);
 
         Assert.IsType<AcceptedResult>(result);
     }
 
     [Fact]
-    public async Task CreateOrder_DevePublicarMensagemNoRabbitMQ()
+    public void CreateOrder_DeveEnfileirarMensagemNoOutbox()
     {
         var request = new CreateOrderRequest("João Silva", 150.90m);
 
-        await _controller.CreateOrder(request);
+        _controller.CreateOrder(request);
 
-        _publisherMock.Verify(
-            p => p.PublishAsync(It.IsAny<OrderCreatedMessage>()),
-            Times.Once
-        );
+        Assert.Equal(1, _outbox.Count);
     }
 
     [Fact]
-    public async Task CreateOrder_MensagemPublicada_DeveTerDadosCorretos()
+    public void CreateOrder_MensagemEnfileirada_DeveTerDadosCorretos()
     {
         var request = new CreateOrderRequest("Maria Costa", 299.99m);
-        OrderCreatedMessage? mensagemCapturada = null;
 
-        _publisherMock
-            .Setup(p => p.PublishAsync(It.IsAny<OrderCreatedMessage>()))
-            .Callback<OrderCreatedMessage>(msg => mensagemCapturada = msg);
+        _controller.CreateOrder(request);
 
-        await _controller.CreateOrder(request);
-
-        Assert.NotNull(mensagemCapturada);
-        Assert.Equal("Maria Costa", mensagemCapturada.CustomerName);
-        Assert.Equal(299.99m, mensagemCapturada.TotalAmount);
-        Assert.NotEqual(Guid.Empty, mensagemCapturada.OrderId);
+        _outbox.TryPeek(out var mensagem);
+        Assert.NotNull(mensagem);
+        Assert.Equal("Maria Costa", mensagem!.CustomerName);
+        Assert.Equal(299.99m, mensagem.TotalAmount);
+        Assert.NotEqual(Guid.Empty, mensagem.OrderId);
     }
 
     [Fact]
-    public async Task CreateOrder_ResponseBody_DeveConterOrderId()
+    public void CreateOrder_ResponseBody_DeveConterOrderId()
     {
         var request = new CreateOrderRequest("Carlos Lima", 50m);
 
-        var result = await _controller.CreateOrder(request) as AcceptedResult;
+        var result = _controller.CreateOrder(request) as AcceptedResult;
 
-        var body = result!.Value!;
+        var body    = result!.Value!;
         var orderId = body.GetType().GetProperty("OrderId")?.GetValue(body);
-        var status = body.GetType().GetProperty("Status")?.GetValue(body) as string;
+        var status  = body.GetType().GetProperty("Status")?.GetValue(body) as string;
 
         Assert.NotNull(orderId);
         Assert.Equal("Pedido recebido e sendo processado", status);
@@ -2384,66 +1898,189 @@ public class OrdersControllerTests
 }
 ```
 
-**Entendendo os conceitos de teste:**
+**Diferenças em relação à versão anterior:**
 
-#### O que é Mock?
+1. **Sem Mock!** O controller agora recebe `OutboxStore` diretamente (não uma interface). Como o OutboxStore é simples e sem efeitos colaterais externos, podemos usar uma instância real no teste.
+2. **Testes síncronos:** como o controller agora é síncrono, os testes também são (`void` em vez de `async Task`).
+3. **Verificação pelo OutboxStore:** em vez de `_publisherMock.Verify(...)`, verificamos diretamente que a mensagem está no outbox com `_outbox.Count` e `_outbox.TryPeek`.
 
-Um **Mock** é um objeto "falso" que simula o comportamento de um objeto real. No nosso caso, `Mock<IRabbitMqPublisher>` cria um publisher falso que não conecta no RabbitMQ de verdade. Isso nos permite testar o controller **isoladamente**, sem precisar de infraestrutura externa.
+### 11.3 Testes do OutboxStore
 
-#### O que é `[Fact]`?
-
-É um atributo do xUnit que marca um método como um **teste**. Quando rodamos `dotnet test`, o framework encontra todos os métodos marcados com `[Fact]` e os executa.
-
-#### Padrão AAA (Arrange, Act, Assert)
-
-Cada teste segue o padrão:
-1. **Arrange** (Preparar): criar os objetos e condições necessárias.
-2. **Act** (Agir): executar a ação que queremos testar.
-3. **Assert** (Verificar): checar se o resultado é o esperado.
-
-#### Explicando cada teste
-
-**Teste 1 — Deve retornar 202:**
-Verifica que o controller retorna HTTP 202 Accepted quando recebe um request válido.
-
-**Teste 2 — Deve publicar no RabbitMQ:**
-Verifica que o método `PublishAsync` foi chamado **exatamente uma vez**. O `Verify` do Moq é como perguntar: "Ei mock, alguém chamou esse método? Quantas vezes?"
-
-**Teste 3 — Dados corretos na mensagem:**
-Usa `Callback` para **capturar** o argumento passado ao `PublishAsync` e verifica que os dados do pedido estão corretos na mensagem publicada.
-
-**Teste 4 — Response body com OrderId:**
-Verifica que o corpo da resposta contém o `OrderId` e o status correto. Usa reflection (`GetProperty`) porque o controller retorna um objeto anônimo.
-
-#### NullLogger
+Crie `OrderService.Tests/Outbox/OutboxStoreTests.cs`:
 
 ```csharp
-NullLogger<OrdersController>.Instance
+using Contracts;
+using OrderService.Outbox;
+
+namespace OrderService.Tests.Outbox;
+
+public class OutboxStoreTests
+{
+    [Fact]
+    public void Enqueue_AdicionaMensagem_CountAumenta()
+    {
+        var store = new OutboxStore();
+        var message = new OrderCreatedMessage { OrderId = Guid.NewGuid() };
+
+        store.Enqueue(message);
+
+        Assert.Equal(1, store.Count);
+    }
+
+    [Fact]
+    public void TryPeek_RetornaMensagem_SemRemover()
+    {
+        var store = new OutboxStore();
+        var message = new OrderCreatedMessage { OrderId = Guid.NewGuid() };
+        store.Enqueue(message);
+
+        var found = store.TryPeek(out var peeked);
+
+        Assert.True(found);
+        Assert.Equal(message.OrderId, peeked!.OrderId);
+        Assert.Equal(1, store.Count);
+    }
+
+    [Fact]
+    public void TryDequeue_RetornaMensagem_ERemove()
+    {
+        var store = new OutboxStore();
+        var message = new OrderCreatedMessage { OrderId = Guid.NewGuid() };
+        store.Enqueue(message);
+
+        var found = store.TryDequeue(out var dequeued);
+
+        Assert.True(found);
+        Assert.Equal(message.OrderId, dequeued!.OrderId);
+        Assert.Equal(0, store.Count);
+    }
+
+    [Fact]
+    public void TryPeek_FilaVazia_RetornaFalse()
+    {
+        var store = new OutboxStore();
+
+        var found = store.TryPeek(out var message);
+
+        Assert.False(found);
+        Assert.Null(message);
+    }
+
+    [Fact]
+    public void Enqueue_MultiplasMensagens_MantemOrdem()
+    {
+        var store = new OutboxStore();
+        var ids = Enumerable.Range(0, 3).Select(_ => Guid.NewGuid()).ToList();
+
+        foreach (var id in ids)
+            store.Enqueue(new OrderCreatedMessage { OrderId = id });
+
+        foreach (var id in ids)
+        {
+            store.TryDequeue(out var msg);
+            Assert.Equal(id, msg!.OrderId);
+        }
+    }
+
+    [Fact]
+    public void ThreadSafety_EnqueueConcorrente_NaoPerdeEntradas()
+    {
+        var store = new OutboxStore();
+        var threads = 10;
+        var messagesPerThread = 100;
+
+        Parallel.For(0, threads, _ =>
+        {
+            for (int i = 0; i < messagesPerThread; i++)
+                store.Enqueue(new OrderCreatedMessage { OrderId = Guid.NewGuid() });
+        });
+
+        Assert.Equal(threads * messagesPerThread, store.Count);
+    }
+}
 ```
 
-Um logger que **descarta tudo** — nos testes, não precisamos ver logs.
+**Destaque: o teste de thread safety.** O `Parallel.For` cria 10 threads que enfileiram 100 mensagens cada uma simultaneamente. Se o `ConcurrentQueue` não fosse thread-safe, poderíamos perder entradas. O assert garante que todas as 1.000 mensagens foram enfileiradas.
 
-> 💭 **Pare e pense — o que esses testes NÃO testam**
->
-> Nossos testes unitários são rápidos e isolados, mas existe um mundo que eles não cobrem: a serialização/deserialização JSON funciona corretamente? A mensagem realmente chega no RabbitMQ? O `Persistent = true` realmente persiste após um restart? A idempotência funciona com dois consumers rodando em paralelo? Isso não é crítica — testes unitários têm esse escopo intencionalmente. A pergunta é: **quais dessas lacunas os testes de integração preenchem?** E quais ficam descobertas?
+### 11.4 Testes do OutboxPublisher
 
-> 🌍 **Além do tutorial — a pirâmide de testes**
->
-> O modelo clássico de Mike Cohn define três camadas: muitos **unitários** (rápidos, baratos, isolados), alguns **de integração** (médios, com infraestrutura real), poucos **end-to-end** (lentos, caros, frágeis). Não existe resposta certa para a proporção — depende do sistema. O que importa é entender o *custo* e o *valor* de cada camada. Um teste E2E que cobre um fluxo crítico de negócio vale mais do que 200 testes unitários de código trivial.
+Crie `OrderService.Tests/Outbox/OutboxPublisherTests.cs`:
 
-> 🧩 **Desafio — aumentando a cobertura**
->
-> Nossos testes não cobrem o cenário de falha: e se o `PublishAsync` lançar uma exceção? O controller deveria retornar 500? Ou capturar e retornar algo mais amigável? Escreva um novo `[Fact]` que configura o mock para lançar uma exceção e verifica o comportamento esperado. Depois pense: você precisaria modificar o código de produção para que o teste passe?
+```csharp
+using Contracts;
+using Microsoft.Extensions.Logging.Abstractions;
+using Moq;
+using OrderService.Messaging;
+using OrderService.Outbox;
 
+namespace OrderService.Tests.Outbox;
 
+public class OutboxPublisherTests
+{
+    private readonly Mock<IRabbitMqPublisher> _publisherMock = new();
+    private readonly OutboxStore _store = new();
+
+    [Fact]
+    public async Task Publisher_PublicaMensagem_ERemoveDoStore()
+    {
+        var message = new OrderCreatedMessage { OrderId = Guid.NewGuid() };
+        _store.Enqueue(message);
+
+        _publisherMock
+            .Setup(p => p.PublishAsync(It.IsAny<OrderCreatedMessage>()))
+            .Returns(Task.CompletedTask);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        var publisher = new OutboxPublisher(
+            _store, _publisherMock.Object, NullLogger<OutboxPublisher>.Instance
+        );
+
+        _ = publisher.StartAsync(cts.Token);
+        await Task.Delay(1_500, CancellationToken.None);
+
+        _publisherMock.Verify(p => p.PublishAsync(It.IsAny<OrderCreatedMessage>()), Times.Once);
+        Assert.Equal(0, _store.Count);
+
+        await publisher.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task Publisher_QuandoPublishFalha_NaoRemoveMensagemDoStore()
+    {
+        var message = new OrderCreatedMessage { OrderId = Guid.NewGuid() };
+        _store.Enqueue(message);
+
+        _publisherMock
+            .Setup(p => p.PublishAsync(It.IsAny<OrderCreatedMessage>()))
+            .ThrowsAsync(new Exception("RabbitMQ indisponível"));
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        var publisher = new OutboxPublisher(
+            _store, _publisherMock.Object, NullLogger<OutboxPublisher>.Instance
+        );
+
+        _ = publisher.StartAsync(cts.Token);
+        await Task.Delay(2_500, CancellationToken.None);
+
+        Assert.Equal(1, _store.Count);
+
+        await publisher.StopAsync(CancellationToken.None);
+    }
+}
+```
+
+**Esses testes validam a garantia mais crítica do Outbox:**
+
+- **Teste 1**: quando o publish é bem-sucedido, a mensagem é removida do store.
+- **Teste 2**: quando o publish falha, a mensagem **permanece** no store para retry. Se ela fosse removida mesmo em falha, perderíamos a mensagem.
 
 ---
 
-## 9. Etapa 6 — Testes de Integração
+## 12. Etapa 9 — Testes de Integração
 
-Os testes de integração verificam que os serviços funcionam juntos com infraestrutura real. Usamos **Testcontainers** para subir um RabbitMQ de verdade em um container Docker durante os testes.
+Os testes de integração verificam que os serviços funcionam com infraestrutura real. Usamos **Testcontainers** para subir um RabbitMQ de verdade em um container Docker durante os testes.
 
-### 9.1 Instalar os pacotes
+### 12.1 Instalar pacotes
 
 ```powershell
 cd Integration.Tests
@@ -2453,65 +2090,15 @@ dotnet add reference ../OrderService/OrderService.csproj
 cd ..
 ```
 
-**O que é Testcontainers?**
+### 12.2 Criar os testes
 
-É uma biblioteca que cria e gerencia containers Docker durante os testes. Ela:
-1. Sobe um container RabbitMQ antes do teste.
-2. Fornece a porta mapeada para conectar.
-3. Derruba o container automaticamente após o teste.
-
-É como ter um RabbitMQ temporário e descartável só para testes.
-
-> 🌍 **Além do tutorial — Testcontainers é amplamente usado**
->
-> Testcontainers existe para praticamente toda infraestrutura: PostgreSQL, MySQL, Redis, Elasticsearch, Kafka, S3 (LocalStack), e muito mais. O padrão de "subir infraestrutura real nos testes" é muito mais confiável do que mocks de banco de dados ou de broker — você testa o comportamento real, não uma simulação. O custo é tempo de execução. Por isso testes de integração ficam separados dos unitários e podem rodar em paralelo no CI mas não no inner-loop de desenvolvimento.
-
-
-
-### 9.2 Verificar o .csproj
-
-O `Integration.Tests/Integration.Tests.csproj`:
-
-```xml
-<Project Sdk="Microsoft.NET.Sdk">
-
-  <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
-    <IsPackable>false</IsPackable>
-    <IsTestProject>true</IsTestProject>
-  </PropertyGroup>
-
-  <ItemGroup>
-    <PackageReference Include="coverlet.collector" Version="6.0.0" />
-    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.8.0" />
-    <PackageReference Include="RabbitMQ.Client" Version="7.2.1" />
-    <PackageReference Include="Testcontainers.RabbitMq" Version="4.11.0" />
-    <PackageReference Include="xunit" Version="2.5.3" />
-    <PackageReference Include="xunit.runner.visualstudio" Version="2.5.3" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <Using Include="Xunit" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <ProjectReference Include="..\OrderService\OrderService.csproj" />
-  </ItemGroup>
-
-</Project>
-```
-
-### 9.3 Criar os testes de integração
-
-Crie o arquivo `Integration.Tests/OrderCreatedFlowTests.cs`:
+Crie `Integration.Tests/OrderCreatedFlowTests.cs`:
 
 ```csharp
 using System.Text;
 using System.Text.Json;
 using OrderService.Messaging;
-using OrderService.Models;
+using Contracts;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 using Testcontainers.RabbitMq;
@@ -2636,39 +2223,17 @@ public class OrderCreatedFlowTests : IAsyncLifetime
 }
 ```
 
-**Explicando os conceitos novos:**
+**O que é Testcontainers?** Uma biblioteca que cria e gerencia containers Docker durante os testes. Ela sobe um RabbitMQ real, executa os testes contra ele, e o derruba automaticamente. É como ter infraestrutura descartável.
 
-#### IAsyncLifetime
+**`IAsyncLifetime`**: interface do xUnit que fornece `InitializeAsync` (antes do teste) e `DisposeAsync` (depois do teste).
 
-```csharp
-public class OrderCreatedFlowTests : IAsyncLifetime
-```
-
-`IAsyncLifetime` é uma interface do xUnit que fornece dois métodos:
-- `InitializeAsync`: roda **antes** de cada teste — usamos para subir o container.
-- `DisposeAsync`: roda **depois** de cada teste — usamos para derrubar o container.
-
-#### TaskCompletionSource
-
-```csharp
-var tcs = new TaskCompletionSource<OrderCreatedMessage>();
-```
-
-Isso cria um `Task` que podemos **completar manualmente**. Quando a mensagem chega no consumer, chamamos `tcs.SetResult(received)` e o `await tcs.Task` no teste é liberado. É como criar uma promessa: "vou te entregar um resultado quando ele chegar".
-
-#### GetMappedPublicPort
-
-```csharp
-var port = _rabbitMqContainer.GetMappedPublicPort(5672);
-```
-
-O Testcontainers mapeia a porta 5672 do container para uma **porta aleatória** no host. Isso evita conflitos se você já tiver outro RabbitMQ rodando na porta 5672.
+**`TaskCompletionSource`**: cria um `Task` que completamos manualmente quando a mensagem chega.
 
 ---
 
-## 10. Etapa 7 — Rodando o Projeto Completo
+## 13. Etapa 10 — Rodando o Projeto Completo
 
-### 10.1 Subir o ambiente com Docker Compose
+### 13.1 Subir o ambiente
 
 Na raiz do projeto:
 
@@ -2676,38 +2241,28 @@ Na raiz do projeto:
 docker compose up --build
 ```
 
-**O que esse comando faz:**
-1. Constrói as imagens Docker dos dois serviços (OrderService e NotificationService).
-2. Sobe o container do RabbitMQ.
-3. Sobe os containers dos serviços.
-4. Mostra os logs de todos os containers no terminal.
+Agora o Docker vai construir **6 imagens** e subir **6 containers** (RabbitMQ + 5 serviços .NET).
 
-**Espere até ver no terminal:**
+**Espere até ver nos logs:**
 
 ```text
 notification-service  | NotificationService pronto. Aguardando mensagens...
+email-service         | [EmailService] Pronto. Aguardando notificações de email...
+push-service          | [PushService] Pronto. Aguardando notificações de push...
+sms-service           | [SmsService] Pronto. Aguardando notificações de SMS...
 ```
 
-Isso significa que tudo está funcionando.
+### 13.2 Criar um pedido
 
-### 10.2 Criar um pedido
-
-Abra **outro terminal** (não feche o Docker Compose) e envie um pedido:
+Abra **outro terminal**:
 
 **PowerShell:**
 
 ```powershell
-$body = @{
-    customerName = "Joao Silva"
-    totalAmount  = 150.90
-} | ConvertTo-Json
-
 Invoke-RestMethod -Method Post -Uri "http://localhost:5000/orders" `
   -ContentType "application/json" `
-  -Body $body
+  -Body '{"customerName": "Joao Silva", "totalAmount": 150.90}'
 ```
-
-> **Atenção:** não use aspas simples ao redor do JSON no PowerShell — pode causar erro 400. Use o `ConvertTo-Json` como mostrado acima.
 
 **curl (Git Bash ou Linux):**
 
@@ -2726,84 +2281,85 @@ curl -X POST http://localhost:5000/orders \
 }
 ```
 
-### 10.3 O que observar nos logs
-
-Volte ao terminal do Docker Compose. Você verá algo como:
+### 13.3 O que observar nos logs
 
 ```text
-order-service         | Pedido a1b2c3d4-... publicado no RabbitMQ
-notification-service  | [OrderConsumer] Pedido a1b2c3d4-... → 3 notificações despachadas
-notification-service  | [EMAIL] Enviado para joao.silva@example.com | Pedido a1b2c3d4-...
-notification-service  | [PUSH] Enviado para device-a1b2c3d4 | Pedido a1b2c3d4-...
-notification-service  | [RETRY 1/3] sms falhou: Operadora indisponível para '+55 11 9 0000-0000'. Aguardando 5s.
-notification-service  | [SMS] Enviado para +55 11 9 0000-0000 | Pedido a1b2c3d4-...
+order-service         | Pedido a1b2c3d4-... gravado no Outbox
+notification-service  | [OrderConsumer] Pedido a1b2c3d4-... → 3 notificações despachadas (email, push, sms)
+email-service         | [EmailService] Enviado para joao.silva@example.com (pedido a1b2c3d4-...)
+push-service          | [PushService] Enviado para device-a1b2c3d4 (pedido a1b2c3d4-...)
+sms-service           | [SmsService] [RETRY 1/3] ...
+sms-service           | [SmsService] Enviado para +55 11 9 0000-0000 (pedido a1b2c3d4-...)
 ```
 
-Como os handlers têm taxas de falha simuladas, você verá retries acontecendo naturalmente. Envie vários pedidos para ver o mecanismo de DLQ em ação.
+Cada serviço agora loga com seu próprio prefixo (`[EmailService]`, `[PushService]`, `[SmsService]`), facilitando identificar qual serviço processou cada notificação.
 
-### 10.4 Acessar o painel do RabbitMQ
+### 13.4 Painel do RabbitMQ
 
-Abra no navegador: http://localhost:15672
+Acesse: http://localhost:15672 (usuário: `guest`, senha: `guest`)
 
-- **Usuário:** guest
-- **Senha:** guest
+No painel, em **Queues**, você verá agora muito mais filas:
 
-No painel, vá em **Queues** para ver:
-- `orders`: fila de pedidos (deve estar vazia se tudo foi consumido).
-- `notifications`: fila principal de notificações.
-- `notifications.retry.1`, `.2`, `.3`: filas de retry.
-- `notifications.dlq`: mensagens que falharam após todas as tentativas.
+- `orders`
+- `notifications.email`, `notifications.push`, `notifications.sms`
+- `notifications.email.retry.1/2/3`, `notifications.push.retry.1/2/3`, `notifications.sms.retry.1/2/3`
+- `notifications.email.dlq`, `notifications.push.dlq`, `notifications.sms.dlq`
 
-### 10.5 Rodar os testes
+### 13.5 Verificar Health Check
+
+```powershell
+Invoke-RestMethod http://localhost:5000/health
+```
+
+Deve retornar `Healthy`.
+
+### 13.6 Rodar os testes
 
 ```powershell
 dotnet test
 ```
 
-Isso executa tanto os testes unitários quanto os de integração. Os testes de integração vão subir um container RabbitMQ temporário automaticamente (precisa do Docker rodando).
-
-### 10.6 Parar o ambiente
-
-No terminal do Docker Compose, pressione `Ctrl+C` e depois:
+### 13.7 Parar o ambiente
 
 ```powershell
 docker compose down
 ```
 
-Isso derruba todos os containers e limpa os recursos.
-
 ---
 
-## 11. Glossário
+## 14. Glossário
 
 | Termo | Definição |
 |-------|-----------|
 | **AMQP** | Advanced Message Queuing Protocol — protocolo de mensageria usado pelo RabbitMQ |
 | **API** | Application Programming Interface — interface para comunicação entre programas |
 | **Async/Await** | Padrão de programação assíncrona em C# — permite esperar por operações longas sem travar |
-| **Backoff Exponencial** | Estratégia de retry onde o tempo de espera cresce exponencialmente entre tentativas |
+| **Backoff Exponencial** | Estratégia de retry onde o tempo de espera cresce entre tentativas (5s, 15s, 45s) |
 | **Container** | Ambiente isolado e portátil para rodar aplicações (gerenciado pelo Docker) |
 | **Consumer** | Programa que lê e processa mensagens de uma fila |
 | **DI (Dependency Injection)** | Padrão onde objetos recebem suas dependências externamente |
+| **Dispatcher** | Componente que recebe uma mensagem e a direciona para o destino correto |
 | **DLQ (Dead Letter Queue)** | Fila para mensagens que falharam e não serão mais retentadas |
 | **DTO (Data Transfer Object)** | Objeto usado apenas para transportar dados entre camadas |
 | **Exchange** | Componente do RabbitMQ que roteia mensagens para filas |
-| **GUID** | Globally Unique Identifier — identificador único universal (ex: `a1b2c3d4-e5f6-...`) |
+| **GUID** | Globally Unique Identifier — identificador único universal |
+| **Healthcheck** | Verificação periódica de que um serviço está funcionando |
 | **HTTP 202 Accepted** | "Recebi seu pedido, mas ainda estou processando" |
 | **Idempotência** | Propriedade de uma operação que, executada múltiplas vezes, produz o mesmo resultado |
 | **JSON** | JavaScript Object Notation — formato leve de troca de dados |
 | **Microserviço** | Serviço pequeno e independente que faz uma coisa bem feita |
 | **Mock** | Objeto falso usado em testes para simular dependências |
 | **Multi-stage build** | Técnica de Dockerfile com múltiplos estágios para imagens menores |
+| **Outbox Pattern** | Padrão onde mensagens são gravadas localmente antes de serem enviadas ao broker |
 | **Producer** | Programa que envia mensagens para uma fila |
 | **Queue (Fila)** | Estrutura onde mensagens ficam armazenadas até serem consumidas |
-| **Record** | Tipo em C# otimizado para dados imutáveis |
+| **Record** | Tipo em C# otimizado para dados imutáveis com suporte a `with` |
 | **REST** | Representational State Transfer — estilo arquitetural para APIs HTTP |
 | **Routing Key** | Chave usada pela exchange para decidir para qual fila enviar a mensagem |
 | **SDK** | Software Development Kit — kit de ferramentas para desenvolver aplicações |
 | **Serialização** | Converter um objeto em texto (JSON) ou bytes para transmissão |
+| **Shared Contracts** | Modelos compartilhados entre microserviços via projeto comum |
 | **Singleton** | Padrão onde apenas uma instância de uma classe existe durante toda a vida da aplicação |
-| **Strategy** | Padrão de design onde algoritmos são encapsulados em classes intercambiáveis |
 | **TTL** | Time To Live — tempo máximo que uma mensagem pode ficar em uma fila |
 | **Worker** | Serviço em segundo plano que roda continuamente executando tarefas |
 | **xUnit** | Framework de testes para .NET |
@@ -2811,7 +2367,7 @@ Isso derruba todos os containers e limpa os recursos.
 
 ---
 
-## 12. Diagrama Completo da Arquitetura
+## 15. Diagrama Completo da Arquitetura
 
 ```text
 ╔══════════════════════════════════════════════════════════════════════════════════════╗
@@ -2820,259 +2376,121 @@ Isso derruba todos os containers e limpa os recursos.
 
   ┌──────────────────┐
   │   Cliente HTTP    │
-  │  (Postman/curl/   │
-  │   navegador)      │
+  │  (Postman/curl)   │
   └────────┬─────────┘
            │ POST /orders
            ▼
-  ┌──────────────────────────────────┐
-  │          OrderService            │  ◄── ASP.NET Web API (.NET 8)
-  │          (porta 5000)            │
-  │                                  │
-  │  OrdersController                │
-  │    └── Enqueue(message)          │
-  │          ▼                       │
-  │      OutboxStore                 │  ◄── in-memory (ConcurrentQueue)
-  │          ▲                       │       nunca falha por indisponibilidade
-  │      OutboxPublisher             │       do RabbitMQ
-  │    (BackgroundService, 1s)       │
-  │    TryPeek → Publish → Dequeue   │
-  │          │                       │
-  │      IRabbitMqPublisher          │
-  └──────────┬───────────────────────┘
-             │ exchange: "" (default)
-             │ routingKey: "orders"
-             ▼
-╔═════════════════════════════════════════════════════════════════════════╗
-║                             RABBITMQ                                   ║
-║                       (Container Docker)                               ║
-║                                                                         ║
-║  ┌───────────┐                                                          ║
-║  │   orders  │ ◄── fila de pedidos (durable)                            ║
-║  └─────┬─────┘                                                          ║
-║        │ (consumido pelo NotificationService)                            ║
-║        ▼                                                                 ║
-║  ┌───────────────────────┐                                               ║
-║  │ notifications.exchange│  ◄── DIRECT exchange compartilhado            ║
-║  │       (DIRECT)        │                                               ║
-║  └──┬──────────┬────┬────┘                                               ║
-║     │"email"   │"push"  │"sms"                                           ║
-║     ▼          ▼        ▼                                                ║
-║  ┌──────────────────────────────────────────────────────────────────┐   ║
-║  │  notifications.email  │  notifications.push  │  notifications.sms │   ║
-║  │  + retry.1/2/3 (TTL)  │  + retry.1/2/3 (TTL) │  + retry.1/2/3    │   ║
-║  │  + email.dlq          │  + push.dlq           │  + sms.dlq        │   ║
-║  └──────────────────────────────────────────────────────────────────┘   ║
-╚═════════════════════════════════════════════════════════════════════════╝
-             │                    │                    │
-             ▼                    ▼                    ▼
-  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
-  │   EmailService   │  │   PushService    │  │   SmsService     │
-  │  Worker (.NET 8) │  │  Worker (.NET 8) │  │  Worker (.NET 8) │
-  │                  │  │                  │  │                  │
-  │ 30% falha sim.   │  │ 20% falha sim.   │  │ 40% falha sim.   │
-  │ (SMTP instável)  │  │ (token expirado) │  │ (operadora)      │
-  │ 50-150ms         │  │ 20-80ms          │  │ 100-300ms        │
-  │                  │  │                  │  │                  │
-  │ Idempotência     │  │ Idempotência     │  │ Idempotência     │
-  │ Retry + DLQ      │  │ Retry + DLQ      │  │ Retry + DLQ      │
-  │ Métricas (30s)   │  │ Métricas (30s)   │  │ Métricas (30s)   │
-  └──────────────────┘  └──────────────────┘  └──────────────────┘
+  ┌──────────────────────────────────────────────────┐
+  │              OrderService (porta 5000)            │
+  │                                                   │
+  │  Controller ──▶ OutboxStore ──▶ OutboxPublisher   │
+  │  (síncrono)     (in-memory)     (background 1s)   │
+  │                                   │               │
+  │                                   ▼               │
+  │                           RabbitMqPublisher        │
+  └───────────────────────────────┬───────────────────┘
+                                  │ exchange: "" / routingKey: "orders"
+                                  ▼
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                              RABBITMQ                                      ║
+║                     (Container Docker + healthcheck)                       ║
+║                                                                            ║
+║  ┌──────────┐                                                              ║
+║  │  orders   │                                                             ║
+║  └─────┬────┘                                                              ║
+║        │ (consumido pelo NotificationService)                               ║
+║        ▼                                                                   ║
+║  ┌─────────────────────────┐                                               ║
+║  │  notifications.exchange │  (DIRECT)                                     ║
+║  └─────┬──────┬──────┬────┘                                               ║
+║        │      │      │    routing keys: "email", "push", "sms"            ║
+║        ▼      ▼      ▼                                                    ║
+║  ┌─────────┐ ┌─────────┐ ┌─────────┐                                     ║
+║  │notif.   │ │notif.   │ │notif.   │                                     ║
+║  │email    │ │push     │ │sms      │                                     ║
+║  └────┬────┘ └────┬────┘ └────┬────┘                                     ║
+║       │           │           │                                           ║
+║  (cada serviço tem suas próprias retry queues e DLQ)                      ║
+║                                                                            ║
+║  EmailService:  retry.1(5s) → retry.2(15s) → retry.3(45s) → email.dlq   ║
+║  PushService:   retry.1(5s) → retry.2(15s) → retry.3(45s) → push.dlq    ║
+║  SmsService:    retry.1(5s) → retry.2(15s) → retry.3(45s) → sms.dlq     ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+           │                    │                    │
+           ▼                    ▼                    ▼
+  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+  │ EmailService │    │ PushService  │    │  SmsService  │
+  │ (30% falha)  │    │ (20% falha)  │    │ (40% falha)  │
+  │              │    │              │    │              │
+  │ - Consumer   │    │ - Consumer   │    │ - Consumer   │
+  │ - Idempotênc.│    │ - Idempotênc.│    │ - Idempotênc.│
+  │ - Métricas   │    │ - Métricas   │    │ - Métricas   │
+  │ - Retry/DLQ  │    │ - Retry/DLQ  │    │ - Retry/DLQ  │
+  └──────────────┘    └──────────────┘    └──────────────┘
 
-  ┌────────────────────────────────────────────────────────────┐
-  │              NotificationService (Dispatcher)              │
-  │              Worker (.NET 8)                               │
-  │                                                            │
-  │  OrderConsumer: lê "orders", cria 3 NotificationMessages,  │
-  │  publica em notifications.exchange com routing key =        │
-  │  notification.Type ("email" | "push" | "sms")              │
-  └────────────────────────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────────┐
+  │              NotificationService                  │
+  │              (Dispatcher puro)                    │
+  │                                                   │
+  │  OrderConsumer: lê "orders"                       │
+  │  → gera 3 NotificationMessage (email, push, sms) │
+  │  → publica em notifications.exchange              │
+  │    com routingKey = tipo da notificação           │
+  └──────────────────────────────────────────────────┘
 
-  Shared Library:
-  ┌─────────────────────────────────────────────────────┐
-  │  Contracts (classlib)                               │
-  │  ┌───────────────────────┬──────────────────────┐   │
-  │  │  OrderCreatedMessage  │  NotificationMessage  │   │
-  │  └───────────────────────┴──────────────────────┘   │
-  │  Referenciado por: OrderService, NotificationService,│
-  │  EmailService, PushService, SmsService               │
-  └─────────────────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────────┐
+  │                    Contracts                      │
+  │              (Projeto compartilhado)              │
+  │                                                   │
+  │  - OrderCreatedMessage                            │
+  │  - NotificationMessage                            │
+  │                                                   │
+  │  Referenciado por todos os serviços               │
+  └──────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 13. Outbox Pattern — Garantindo que Mensagens Não se Perdem
-
-### O problema
-
-O `OrdersController` atual publica diretamente no RabbitMQ. O que acontece se o RabbitMQ estiver fora do ar no momento do pedido? A mensagem se perde, o pedido some, e o cliente não recebe nenhuma notificação.
-
-```text
-Sem Outbox:
-  Controller ──► RabbitMQPublisher ──► RabbitMQ
-                        ▲
-                   E se falhar aqui?
-                   A mensagem é perdida.
-```
-
-### A solução: Outbox Pattern
-
-O Outbox Pattern resolve isso com duas etapas:
-
-1. **Gravar localmente primeiro**: o controller coloca a mensagem numa estrutura local (o "outbox"), que nunca falha por motivos externos.
-2. **Publicar em background**: um processo em segundo plano drena o outbox em direção ao RabbitMQ.
-
-```text
-Com Outbox:
-  Controller ──► OutboxStore ──► (local, nunca falha)
-                                        ▲
-                               OutboxPublisher (1s)
-                                        │
-                               IRabbitMqPublisher ──► RabbitMQ
-                               Se falhar: não descarta,
-                               tenta no próximo ciclo.
-```
-
-### A lógica crítica: Peek antes de Dequeue
-
-```csharp
-// CERTO — peek antes de publicar:
-while (store.TryPeek(out var msg))
-{
-    await publisher.PublishAsync(msg);  // se falhar: throw
-    store.TryDequeue(out _);             // descarta SÓ após confirmação
-}
-
-// ERRADO — Dequeue antes de publicar:
-while (store.TryDequeue(out var msg))
-{
-    await publisher.PublishAsync(msg);  // se falhar: msg JÁ foi removida → perdida!
-}
-```
-
-Se você chamar `TryDequeue` antes de publicar e a publicação falhar, a mensagem some para sempre. O `TryPeek` garante que a mensagem permanece no store até confirmação de sucesso.
-
-### Implementação neste projeto
-
-**`OrderService/Outbox/OutboxStore.cs`** — wrapper de `ConcurrentQueue<OrderCreatedMessage>` com `Enqueue`, `TryPeek`, `TryDequeue`.
-
-**`OrderService/Outbox/OutboxPublisher.cs`** — `BackgroundService` com `PeriodicTimer(1s)`:
-```csharp
-while (TryPeek(out msg))
-{
-    try   { await Publish(msg); Dequeue(); }
-    catch { Log.Warning(...); break; }  // não descarta, tenta no próximo ciclo
-}
-```
-
-**`OrdersController.cs`** — agora injeta `OutboxStore` (não `IRabbitMqPublisher`):
-```csharp
-_outbox.Enqueue(message);  // síncrono, local, nunca falha
-return Accepted(...);       // responde imediatamente
-```
-
-### Limitações desta implementação (in-memory)
-
-Esta implementação usa `ConcurrentQueue` em memória. Se o processo reiniciar, as mensagens pendentes se perdem. Para produção:
-
-| Aspecto | In-memory (aqui) | Produção |
-|---|---|---|
-| **Persistência** | Não — perde na reinicialização | Tabela no banco de dados |
-| **Atomicidade** | Não — controller e outbox são operações separadas | Mesma transação do banco |
-| **Escalabilidade** | Não — funciona com 1 instância | Banco compartilhado, múltiplas instâncias |
-
-> **Em produção**: a tabela `outbox_messages` fica no mesmo banco de dados que a entidade `orders`. O controller grava os dois na **mesma transação**. Se a transação falhar, nenhum dos dois persiste. Se o processo reiniciar, o OutboxPublisher relê o banco e continua de onde parou. Essa garantia chama-se **atomicidade** — o "A" do ACID.
-
-### Por que isso cai em entrevista sênior?
-
-O Outbox Pattern aparece sempre que a pergunta é: *"Como você garante consistência entre seu banco de dados e seu broker de mensagens?"*. A resposta errada é "uso uma transação distribuída (2PC)". A resposta certa é: "uso o Outbox Pattern — gravo no banco e publico via polling do mesmo banco."
-
----
-
-## 14. Dicas e Próximos Passos
+## 16. Dicas e Próximos Passos
 
 ### O que você aprendeu
 
-- Como criar uma **API Web** com ASP.NET Core.
-- Como criar um **Worker Service** para processamento em segundo plano.
-- Como usar **RabbitMQ** para comunicação assíncrona entre serviços.
-- Como implementar **retry com backoff exponencial** e **Dead Letter Queue**.
+- Como criar uma **API Web** com ASP.NET Core e **Outbox Pattern**.
+- Como criar **Worker Services** para processamento em segundo plano.
+- Como usar **RabbitMQ** para comunicação assíncrona entre microserviços.
+- Como implementar **retry com backoff exponencial** e **Dead Letter Queue** isoladas por serviço.
 - Como garantir **idempotência** no processamento de mensagens.
-- Como **containerizar** aplicações .NET com Docker.
-- Como **orquestrar** múltiplos containers com Docker Compose.
+- Como criar um **projeto de contratos compartilhados** entre microserviços.
+- Como **containerizar** aplicações .NET com Docker (multi-projeto).
+- Como configurar **healthchecks** no Docker Compose para dependências.
+- Como **orquestrar** 6 containers com Docker Compose.
 - Como escrever **testes unitários** com xUnit e Moq.
 - Como escrever **testes de integração** com Testcontainers.
-- Como usar **Injeção de Dependência** e o padrão **Strategy**.
+- Como usar **Injeção de Dependência** nativa do .NET.
 
 ### Ideias para evoluir o projeto
 
-1. **Adicionar um banco de dados**: use Entity Framework Core com PostgreSQL para persistir os pedidos.
+1. **Adicionar um banco de dados**: use Entity Framework Core com PostgreSQL para persistir os pedidos e o Outbox (garantia de atomicidade real).
 2. **Implementar idempotência com Redis**: substitua o `ConcurrentDictionary` por Redis para funcionar com múltiplas instâncias.
-3. **Adicionar health checks**: implemente `/health` endpoints para monitorar a saúde dos serviços.
+3. **Adicionar health checks customizados**: crie health checks que verificam a conexão com o RabbitMQ.
 4. **Usar OpenTelemetry**: adicione tracing distribuído para rastrear uma requisição por todos os serviços.
 5. **Adicionar API Gateway**: coloque um gateway (como YARP ou Ocelot) na frente dos serviços.
 6. **Implementar autenticação**: adicione JWT para proteger o endpoint de pedidos.
 7. **Adicionar Swagger/OpenAPI**: documente a API com Swagger UI.
-8. **Escalar horizontalmente**: suba múltiplas instâncias do NotificationService e veja o RabbitMQ distribuindo as mensagens.
+8. **Escalar horizontalmente**: suba múltiplas instâncias do EmailService e veja o RabbitMQ distribuindo as mensagens.
 9. **Adicionar CI/CD**: configure GitHub Actions para rodar os testes automaticamente a cada push.
-10. **Separar a topologia**: crie um serviço dedicado para gerenciar a topologia do RabbitMQ.
+10. **Outbox com banco de dados**: implemente o Outbox Pattern real com Entity Framework + Transação.
 
 ### Comandos úteis de referência rápida
----
-
-## 15. Mapa de Decisões — Quando Usar Cada Coisa
-
-Este tutorial cobriu muitas ferramentas e padrões. Abaixo está um guia rápido para ajudar a decidir quando aplicar cada conceito em projetos futuros.
-
-### Quando usar mensageria (RabbitMQ, Kafka, SQS...)?
-
-Use quando a operação downstream for:
-- **Lenta** (envio de e-mail, geração de relatório, chamada a API externa)
-- **Não crítica para a resposta imediata** (o cliente não precisa saber o resultado agora)
-- **Suscetível a falhas transitórias** (serviços externos que ficam fora do ar)
-- **Passível de escalonamento independente** (picos de processamento que não afetam o fluxo principal)
-
-Não use mensageria quando precisar de resposta síncrona (ex: verificar saldo antes de aprovar um pagamento).
-
-### Quando usar Retry com Backoff Exponencial?
-
-Use em qualquer integração com sistema externo: APIs de terceiros, bancos de dados, brokers. Valores típicos: 1s / 5s / 30s / 2min. Adicione jitter (variação aleatória) em sistemas com muitos produtores simultâneos para evitar o *thundering herd*.
-
-### Quando usar DLQ?
-
-Sempre que tiver retry. Sem DLQ, mensagens problemáticas ficam em loop infinito ou são descartadas silenciosamente. A DLQ é sua rede de segurança — monitore ela ativamente, não apenas a crie.
-
-### Quando usar Idempotência?
-
-Sempre que uma mensagem pode ser entregue mais de uma vez (AMQP garante *at-least-once*). Armazene o ID da mensagem processada e verifique antes de processar. Em produção, use Redis em vez de `ConcurrentDictionary` para funcionar com múltiplas instâncias do consumer.
-
-### Quando usar o padrão Strategy?
-
-Quando você tem múltiplas variações de um comportamento que podem crescer no futuro e você quer adicionar novas variações sem modificar código existente. Sinais de que Strategy pode ajudar: muitos `if/else` ou `switch` baseados em "tipo" de algo.
-
-### Lifetime de DI: resumo rápido
-
-| Tem estado compartilhado (dicionário, contadores)? | → **Singleton** |
-|---|---|
-| Tem recurso caro (conexão de rede, pool)? | → **Singleton** |
-| Precisa de contexto de uma requisição HTTP (usuário logado, etc.)? | → **Scoped** |
-| É stateless e barato de criar? | → Qualquer um; prefira **Transient** para clareza |
-
-### Containers e Docker: quando faz sentido?
-
-Docker faz sentido quando você quer **paridade entre ambientes** (dev = staging = prod) ou quando o projeto depende de infraestrutura (banco, broker, cache) que não quer instalar globalmente na sua máquina. O custo é complexidade adicional. Para projetos simples sem dependências de infraestrutura, pode ser overkill no início.
-
----
-
-
 
 | Comando | O que faz |
 |---------|-----------|
-| `dotnet new sln -n NomeDaSolucao` | Cria uma solution |
-| `dotnet new webapi -n NomeDoProjeto` | Cria um projeto de API Web |
-| `dotnet new worker -n NomeDoProjeto` | Cria um projeto Worker |
-| `dotnet new xunit -n NomeDoProjeto` | Cria um projeto de testes xUnit |
-| `dotnet sln add Projeto/Projeto.csproj` | Adiciona um projeto à solution |
+| `dotnet new sln -n Nome` | Cria uma solution |
+| `dotnet new classlib -n Nome` | Cria uma biblioteca de classes |
+| `dotnet new webapi -n Nome` | Cria um projeto de API Web |
+| `dotnet new worker -n Nome` | Cria um projeto Worker |
+| `dotnet new xunit -n Nome` | Cria um projeto de testes xUnit |
+| `dotnet sln add Proj/Proj.csproj` | Adiciona um projeto à solution |
 | `dotnet add package NomeDoPacote` | Instala um pacote NuGet |
 | `dotnet add reference ../Outro/Outro.csproj` | Adiciona referência entre projetos |
 | `dotnet build` | Compila a solution |
@@ -3084,6 +2502,6 @@ Docker faz sentido quando você quer **paridade entre ambientes** (dev = staging
 
 ---
 
-**Parabéns!** Se você chegou até aqui, você construiu um sistema de microserviços completo do zero. Isso não é pouca coisa. Agora use esse conhecimento como base para construir seus próprios projetos.
+**Parabéns!** Se você chegou até aqui, você construiu um sistema de microserviços com 6 projetos, comunicação assíncrona, retry resiliente, Outbox Pattern e infraestrutura containerizada. Isso não é pouca coisa. Agora use esse conhecimento como base para construir seus próprios projetos.
 
 *Lembre-se: a melhor forma de aprender é fazendo. Não tenha medo de errar — cada erro é uma aula.*
